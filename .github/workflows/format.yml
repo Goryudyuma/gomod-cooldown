@@ -2,54 +2,45 @@ name: Go formatting
 
 on:
   pull_request:
-  push:
-    branches:
-      - main
-  workflow_dispatch:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - closed
 
 permissions:
-  contents: read
+  contents: write
+  pull-requests: write
 
 concurrency:
-  group: go-formatting-${{ github.ref }}
+  group: go-formatting-${{ github.event.pull_request.number }}
   cancel-in-progress: false
 
 jobs:
-  check:
-    if: github.event_name == 'pull_request'
+  format:
+    # Fork pull requests receive a read-only GITHUB_TOKEN, so they cannot
+    # safely create a formatting pull request. The ordinary CI still runs.
+    if: github.event.action == 'closed' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        if: github.event.action != 'closed'
         with:
           fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        if: github.event.action != 'closed'
         with:
           go-version: 1.25.x
       - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
-        with:
-          version: latest
-          install-only: true
-      - run: golangci-lint fmt --diff
-
-  create-pr:
-    if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pull-requests: write
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        with:
-          fetch-depth: 0
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
-        with:
-          go-version: 1.25.x
-      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        if: github.event.action != 'closed'
         with:
           version: latest
           install-only: true
       - run: golangci-lint fmt
+        if: github.event.action != 'closed'
       - uses: dev-hato/actions-diff-pr-management@5cd3792bc98beed11cda90898bc81af6bfa199af # v2.2.5
+        if: success() || failure()
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           branch-name-prefix: chore/gofmt

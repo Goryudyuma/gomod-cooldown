@@ -124,10 +124,9 @@ golangci-lint fmt
 ```
 
 Tests use `httptest.Server`, injected clients/clocks, and no external network.
-GitHub Actions runs tests, race detection, vet, and `golangci-lint`; a separate
-workflow checks formatting on pull requests and opens a formatting PR after a
-main push or manual run on main when safe `gofmt`/`goimports` changes are
-available.
+GitHub Actions runs tests, race detection, vet, and `golangci-lint`. For an
+in-repository pull request, a separate workflow runs `gofmt`/`goimports` and
+opens or updates a formatting pull request when safe changes are available.
 
 ## License and notices
 

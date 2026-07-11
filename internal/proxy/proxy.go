@@ -1,0 +1,476 @@
+// Package proxy implements the small, temporary GOPROXY used by the CLI.
+package proxy
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"net/url"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/Goryudyuma/gomod-cooldown/internal/availability"
+	"golang.org/x/mod/module"
+	"golang.org/x/mod/semver"
+)
+
+type Config struct {
+	Upstream string
+	Client   *http.Client
+	Source   availability.Source
+	Cooldown time.Duration
+	Now      func() time.Time
+	Logger   *log.Logger
+	Verbose  bool
+}
+
+type Server struct {
+	upstream *url.URL
+	client   *http.Client
+	source   availability.Source
+	cooldown time.Duration
+	now      func() time.Time
+	logger   *log.Logger
+	verbose  bool
+
+	cacheMu sync.Mutex
+	infos   map[string]cachedInfo
+}
+
+type cachedInfo struct {
+	info VersionInfo
+	err  error
+}
+
+type VersionInfo struct {
+	Version string
+	Time    time.Time
+}
+
+func New(cfg Config) (*Server, error) {
+	if cfg.Cooldown <= 0 {
+		return nil, fmt.Errorf("cooldown must be positive")
+	}
+	u, err := url.Parse(cfg.Upstream)
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return nil, fmt.Errorf("invalid upstream URL %q", cfg.Upstream)
+	}
+	if cfg.Source == nil {
+		return nil, errors.New("availability source is required")
+	}
+	if cfg.Client == nil {
+		cfg.Client = &http.Client{Timeout: 30 * time.Second}
+	}
+	// Keep redirects as upstream responses: the proxy must not contact a host
+	// chosen by an upstream Location header.
+	client := *cfg.Client
+	client.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	if cfg.Now == nil {
+		cfg.Now = time.Now
+	}
+	if cfg.Logger == nil {
+		cfg.Logger = log.New(io.Discard, "", 0)
+	}
+	return &Server{upstream: u, client: &client, source: cfg.Source, cooldown: cfg.Cooldown, now: cfg.Now, logger: cfg.Logger, verbose: cfg.Verbose, infos: make(map[string]cachedInfo)}, nil
+}
+
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "only GET is supported", http.StatusMethodNotAllowed)
+		return
+	}
+	if mod, ok := moduleFor(r.URL.EscapedPath(), "/@v/list"); ok {
+		s.handleList(w, r, mod)
+		return
+	}
+	if mod, ok := moduleFor(r.URL.EscapedPath(), "/@latest"); ok {
+		s.handleLatest(w, r, mod)
+		return
+	}
+	s.passthrough(w, r)
+}
+
+func moduleFor(rawPath, suffix string) (string, bool) {
+	if !strings.HasSuffix(rawPath, suffix) {
+		return "", false
+	}
+	escaped := strings.TrimPrefix(strings.TrimSuffix(rawPath, suffix), "/")
+	if escaped == "" {
+		return "", false
+	}
+	path, err := module.UnescapePath(escaped)
+	if err != nil {
+		return "", false
+	}
+	return path, true
+}
+
+func (s *Server) handleList(w http.ResponseWriter, r *http.Request, path string) {
+	body, status, contentType, err := s.fetch(r.Context(), r.URL.EscapedPath())
+	if err != nil {
+		s.badGateway(w, err)
+		return
+	}
+	if status >= http.StatusMultipleChoices && status < http.StatusBadRequest {
+		s.badGateway(w, fmt.Errorf("upstream redirected discovery request for %s", path))
+		return
+	}
+	if status != http.StatusOK {
+		s.writeUpstream(w, status, contentType, body)
+		return
+	}
+	versions, err := parseList(body)
+	if err != nil {
+		s.badGateway(w, fmt.Errorf("invalid upstream list for %s: %w", path, err))
+		return
+	}
+	kept, err := s.filter(r.Context(), path, versions)
+	if err != nil {
+		s.badGateway(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, _ = io.WriteString(w, strings.Join(kept, "\n"))
+	if len(kept) > 0 {
+		_, _ = io.WriteString(w, "\n")
+	}
+}
+
+func (s *Server) handleLatest(w http.ResponseWriter, r *http.Request, path string) {
+	body, status, contentType, err := s.fetch(r.Context(), r.URL.EscapedPath())
+	if err != nil {
+		s.badGateway(w, err)
+		return
+	}
+	if status >= http.StatusMultipleChoices && status < http.StatusBadRequest {
+		s.badGateway(w, fmt.Errorf("upstream redirected discovery request for %s", path))
+		return
+	}
+	if status != http.StatusOK {
+		s.writeUpstream(w, status, contentType, body)
+		return
+	}
+	latest, err := validateInfo(body, "")
+	if err != nil {
+		s.badGateway(w, fmt.Errorf("invalid upstream latest for %s: %w", path, err))
+		return
+	}
+	ok, err := s.allowed(r.Context(), path, latest)
+	if err != nil {
+		s.badGateway(w, err)
+		return
+	}
+	if ok {
+		s.writeUpstream(w, status, contentType, body)
+		return
+	}
+
+	listPath, err := endpoint(path, "/@v/list")
+	if err != nil {
+		s.badGateway(w, err)
+		return
+	}
+	listBody, listStatus, _, err := s.fetch(r.Context(), listPath)
+	if err != nil {
+		s.badGateway(w, err)
+		return
+	}
+	if listStatus >= http.StatusMultipleChoices && listStatus < http.StatusBadRequest {
+		s.badGateway(w, fmt.Errorf("upstream redirected discovery request for %s", path))
+		return
+	}
+	if listStatus != http.StatusOK {
+		s.writeUpstream(w, listStatus, "text/plain; charset=utf-8", listBody)
+		return
+	}
+	versions, err := parseList(listBody)
+	if err != nil {
+		s.badGateway(w, fmt.Errorf("invalid upstream list for %s: %w", path, err))
+		return
+	}
+	kept, err := s.filter(r.Context(), path, versions)
+	if err != nil {
+		s.badGateway(w, err)
+		return
+	}
+	chosen := chooseVersion(kept)
+	if chosen == "" {
+		http.NotFound(w, r)
+		return
+	}
+	info, err := s.info(r.Context(), path, chosen)
+	if err != nil {
+		s.badGateway(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(mustJSON(info))
+}
+
+func (s *Server) filter(ctx context.Context, path string, versions []string) ([]string, error) {
+	kept := make([]string, 0, len(versions))
+	for _, version := range versions {
+		if module.IsPseudoVersion(version) {
+			continue
+		} // list must never gain pseudo-versions.
+		if !canonical(version) {
+			return nil, fmt.Errorf("invalid version %q in upstream list for %s", version, path)
+		}
+		info, err := s.info(ctx, path, version)
+		if err != nil {
+			return nil, err
+		}
+		ok, err := s.allowed(ctx, path, info)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			kept = append(kept, version)
+		}
+	}
+	return kept, nil
+}
+
+func (s *Server) allowed(ctx context.Context, path string, info VersionInfo) (bool, error) {
+	a, err := s.source.AvailableAt(ctx, path, info.Version, info.Time)
+	if err != nil {
+		return false, fmt.Errorf("availability time for %s@%s: %w", path, info.Version, err)
+	}
+	cutoff := s.now().Add(-s.cooldown)
+	ok := !a.AvailableAt.After(cutoff)
+	if !ok {
+		first := ""
+		if a.FirstCached != nil {
+			first = a.FirstCached.Format(time.RFC3339)
+		}
+		s.logger.Printf("excluded module=%s version=%s commit_time=%s first_cached_time=%s available_at=%s cutoff=%s", path, info.Version, a.CommitTime.Format(time.RFC3339), first, a.AvailableAt.Format(time.RFC3339), cutoff.Format(time.RFC3339))
+	} else if s.verbose {
+		s.logger.Printf("allowed module=%s version=%s available_at=%s", path, info.Version, a.AvailableAt.Format(time.RFC3339))
+	}
+	return ok, nil
+}
+
+func (s *Server) info(ctx context.Context, path, version string) (VersionInfo, error) {
+	key := path + "\x00" + version
+	s.cacheMu.Lock()
+	c, ok := s.infos[key]
+	s.cacheMu.Unlock()
+	if ok {
+		return c.info, c.err
+	}
+	p, err := endpoint(path, "/@v/"+version+".info")
+	if err == nil {
+		var body []byte
+		var status int
+		body, status, _, err = s.fetch(ctx, p)
+		if err == nil && status != http.StatusOK {
+			err = fmt.Errorf("upstream .info for %s@%s returned %d", path, version, status)
+		}
+		var info VersionInfo
+		if err == nil {
+			info, err = validateInfo(body, version)
+		}
+		if err != nil {
+			err = fmt.Errorf("get .info for %s@%s: %w", path, version, err)
+		}
+		c = cachedInfo{info: info, err: err}
+	} else {
+		c = cachedInfo{err: err}
+	}
+	s.cacheMu.Lock()
+	if old, exists := s.infos[key]; exists {
+		c = old
+	} else {
+		s.infos[key] = c
+	}
+	s.cacheMu.Unlock()
+	return c.info, c.err
+}
+
+func endpoint(path, suffix string) (string, error) {
+	escaped, err := module.EscapePath(path)
+	if err != nil {
+		return "", fmt.Errorf("escape module path %q: %w", path, err)
+	}
+	return "/" + escaped + suffix, nil
+}
+
+func (s *Server) fetch(ctx context.Context, rawPath string) ([]byte, int, string, error) {
+	target, err := s.upstreamURL(rawPath)
+	if err != nil {
+		return nil, 0, "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		return nil, 0, "", fmt.Errorf("create upstream request: %w", err)
+	}
+	if s.verbose {
+		s.logger.Printf("upstream GET %s", target)
+	}
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return nil, 0, "", fmt.Errorf("upstream request: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, 0, "", fmt.Errorf("read upstream response: %w", err)
+	}
+	return body, resp.StatusCode, resp.Header.Get("Content-Type"), nil
+}
+
+func (s *Server) passthrough(w http.ResponseWriter, r *http.Request) {
+	target, err := s.upstreamURL(r.URL.EscapedPath())
+	if err != nil {
+		s.badGateway(w, err)
+		return
+	}
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, target, nil)
+	if err != nil {
+		s.badGateway(w, err)
+		return
+	}
+	resp, err := s.client.Do(req)
+	if err != nil {
+		s.badGateway(w, fmt.Errorf("upstream request: %w", err))
+		return
+	}
+	defer resp.Body.Close()
+	copyHeaders(w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
+}
+
+func (s *Server) writeUpstream(w http.ResponseWriter, status int, contentType string, body []byte) {
+	if contentType != "" {
+		w.Header().Set("Content-Type", contentType)
+	}
+	w.WriteHeader(status)
+	_, _ = w.Write(body)
+}
+func (s *Server) badGateway(w http.ResponseWriter, err error) {
+	s.logger.Printf("proxy error: %v", err)
+	http.Error(w, "gomod-cooldown: "+err.Error(), http.StatusBadGateway)
+}
+
+func parseList(body []byte) ([]string, error) {
+	lines := strings.Split(strings.ReplaceAll(string(body), "\r\n", "\n"), "\n")
+	versions := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if strings.TrimSpace(line) != "" {
+			// Preserve non-empty input verbatim. Whitespace in a version is invalid
+			// and must cause a 502 instead of being silently normalized.
+			versions = append(versions, line)
+		}
+	}
+	return versions, nil
+}
+
+func canonical(v string) bool { return semver.IsValid(v) && module.CanonicalVersion(v) == v }
+
+func validateInfo(body []byte, requested string) (VersionInfo, error) {
+	var raw struct {
+		Version *string          `json:"Version"`
+		Time    *json.RawMessage `json:"Time"`
+	}
+	d := json.NewDecoder(bytes.NewReader(body))
+	if err := d.Decode(&raw); err != nil {
+		return VersionInfo{}, fmt.Errorf("invalid JSON: %w", err)
+	}
+	if d.Decode(&struct{}{}) != io.EOF {
+		return VersionInfo{}, errors.New("invalid JSON: trailing value")
+	}
+	if raw.Version == nil || *raw.Version == "" {
+		return VersionInfo{}, errors.New("missing Version")
+	}
+	if !canonical(*raw.Version) {
+		return VersionInfo{}, fmt.Errorf("non-canonical Version %q", *raw.Version)
+	}
+	if requested != "" && *raw.Version != requested {
+		return VersionInfo{}, fmt.Errorf("Version %q does not match requested %q", *raw.Version, requested)
+	}
+	if raw.Time == nil || string(bytes.TrimSpace(*raw.Time)) == "null" {
+		return VersionInfo{}, errors.New("missing Time")
+	}
+	var stamp string
+	if err := json.Unmarshal(*raw.Time, &stamp); err != nil {
+		return VersionInfo{}, fmt.Errorf("invalid Time: %w", err)
+	}
+	t, err := time.Parse(time.RFC3339, stamp)
+	if err != nil || t.IsZero() {
+		if err != nil {
+			return VersionInfo{}, fmt.Errorf("invalid Time: %w", err)
+		}
+		return VersionInfo{}, errors.New("zero Time")
+	}
+	return VersionInfo{Version: *raw.Version, Time: t}, nil
+}
+
+func chooseVersion(versions []string) string {
+	bestRelease, bestPre := "", ""
+	for _, v := range versions {
+		if !canonical(v) || module.IsPseudoVersion(v) {
+			continue
+		}
+		if semver.Prerelease(v) == "" {
+			if bestRelease == "" || semver.Compare(v, bestRelease) > 0 {
+				bestRelease = v
+			}
+		} else if bestPre == "" || semver.Compare(v, bestPre) > 0 {
+			bestPre = v
+		}
+	}
+	if bestRelease != "" {
+		return bestRelease
+	}
+	return bestPre
+}
+
+func mustJSON(info VersionInfo) []byte {
+	b, _ := json.Marshal(struct {
+		Version string    `json:"Version"`
+		Time    time.Time `json:"Time"`
+	}{info.Version, info.Time})
+	return b
+}
+
+func (s *Server) upstreamURL(rawPath string) (string, error) {
+	decoded, err := url.PathUnescape(rawPath)
+	if err != nil {
+		return "", fmt.Errorf("invalid request path: %w", err)
+	}
+	target := *s.upstream
+	target.Path = strings.TrimRight(s.upstream.Path, "/") + decoded
+	target.RawPath = strings.TrimRight(s.upstream.EscapedPath(), "/") + rawPath
+	target.RawQuery = ""
+	return target.String(), nil
+}
+
+func copyHeaders(dst, src http.Header) {
+	for key, values := range src {
+		if isHopHeader(key) {
+			continue
+		}
+		for _, value := range values {
+			dst.Add(key, value)
+		}
+	}
+}
+
+func isHopHeader(key string) bool {
+	switch strings.ToLower(key) {
+	case "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade":
+		return true
+	default:
+		return false
+	}
+}

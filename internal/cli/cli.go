@@ -21,6 +21,9 @@ import (
 	"github.com/Goryudyuma/gomod-cooldown/internal/proxy"
 )
 
+const timeSourceCommit = "commit"
+
+// Options contains the parsed CLI configuration and child command.
 type Options struct {
 	Cooldown        time.Duration
 	Upstream        string
@@ -30,6 +33,7 @@ type Options struct {
 	Command         []string
 }
 
+// Parse parses command-line arguments without modifying the process environment.
 func Parse(args []string, stderr io.Writer) (Options, error) {
 	sep := -1
 	for i, arg := range args {
@@ -51,8 +55,9 @@ func Parse(args []string, stderr io.Writer) (Options, error) {
 	timeSource := fs.String("time-source", "commit", "availability source: commit (default) or combined")
 	timeout := fs.Duration("upstream-timeout", 30*time.Second, "upstream HTTP timeout")
 	verbose := fs.Bool("verbose", false, "log upstream requests and decisions")
-	if err := fs.Parse(args[:sep]); err != nil {
-		return Options{}, err
+	err := fs.Parse(args[:sep])
+	if err != nil {
+		return Options{}, fmt.Errorf("parse flags: %w", err)
 	}
 	if fs.NArg() != 0 {
 		return Options{}, fmt.Errorf("unexpected argument %q before --", fs.Arg(0))
@@ -64,7 +69,7 @@ func Parse(args []string, stderr io.Writer) (Options, error) {
 	if *timeout <= 0 {
 		return Options{}, errors.New("upstream-timeout must be positive")
 	}
-	if *timeSource != "combined" && *timeSource != "commit" {
+	if *timeSource != "combined" && *timeSource != timeSourceCommit {
 		return Options{}, fmt.Errorf("unsupported time-source %q", *timeSource)
 	}
 	return Options{Cooldown: d, Upstream: *upstream, TimeSource: *timeSource, UpstreamTimeout: *timeout, Verbose: *verbose, Command: args[sep+1:]}, nil
@@ -107,18 +112,20 @@ func ParseCooldown(s string) (time.Duration, error) {
 	return d, nil
 }
 
+// Run starts the proxy and child command, returning the child's exit code.
 func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	opts, err := Parse(args, stderr)
 	if err != nil {
-		fmt.Fprintf(stderr, "gomod-cooldown: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "gomod-cooldown: %v\n", err)
 		return 2
 	}
-	if err := run(ctx, opts, stdin, stdout, stderr); err != nil {
+	err = run(ctx, opts, stdin, stdout, stderr)
+	if err != nil {
 		var exit *exec.ExitError
 		if errors.As(err, &exit) {
 			return exit.ExitCode()
 		}
-		fmt.Fprintf(stderr, "gomod-cooldown: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "gomod-cooldown: %v\n", err)
 		return 1
 	}
 	return 0
@@ -129,7 +136,7 @@ func run(ctx context.Context, opts Options, stdin io.Reader, stdout, stderr io.W
 	started := time.Now()
 	clock := func() time.Time { return started }
 	var source availability.Source
-	if opts.TimeSource == "commit" {
+	if opts.TimeSource == timeSourceCommit {
 		source = availability.CommitTimeSource{}
 	} else {
 		if strings.TrimRight(opts.Upstream, "/") != "https://proxy.golang.org" {
@@ -141,25 +148,37 @@ func run(ctx context.Context, opts Options, stdin io.Reader, stdout, stderr io.W
 		}
 		source = availability.CombinedSource{Recent: recent}
 	}
-	p, err := proxy.New(proxy.Config{Upstream: opts.Upstream, Client: client, Source: source, Cooldown: opts.Cooldown, Now: clock, Logger: log.New(stderr, "gomod-cooldown: ", 0), Verbose: opts.Verbose})
+	p, err := proxy.New(proxy.Config{
+		Upstream: opts.Upstream,
+		Client:   client,
+		Source:   source,
+		Cooldown: opts.Cooldown,
+		Now:      clock,
+		Logger:   log.New(stderr, "gomod-cooldown: ", 0),
+		Verbose:  opts.Verbose,
+	})
 	if err != nil {
-		return err
+		return fmt.Errorf("create proxy: %w", err)
 	}
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", "127.0.0.1:0")
 	if err != nil {
 		return fmt.Errorf("listen on loopback: %w", err)
 	}
-	srv := &http.Server{Handler: p}
+	srv := &http.Server{Handler: p, ReadHeaderTimeout: 5 * time.Second}
 	go func() { _ = srv.Serve(ln) }()
 	defer func() {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)
 	}()
+	//nolint:gosec // The caller explicitly supplies the argv after --; no shell is involved.
 	cmd := exec.CommandContext(ctx, opts.Command[0], opts.Command[1:]...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = stdin, stdout, stderr
 	cmd.Env = withGOPROXY(os.Environ(), "http://"+ln.Addr().String())
-	return cmd.Run()
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("run child command: %w", err)
+	}
+	return nil
 }
 
 func withGOPROXY(env []string, value string) []string {

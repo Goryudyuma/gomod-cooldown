@@ -119,9 +119,14 @@ go mod tidy
 go test ./...
 go vet ./...
 go test -race ./...
+golangci-lint run
+golangci-lint fmt
 ```
 
 Tests use `httptest.Server`, injected clients/clocks, and no external network.
+GitHub Actions runs tests, race detection, vet, and `golangci-lint`; a separate
+weekly (or manually dispatched) workflow opens a formatting PR when safe
+`gofmt`/`goimports` changes are available.
 
 ## License and notices
 

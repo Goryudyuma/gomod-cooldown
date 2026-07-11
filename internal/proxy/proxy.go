@@ -20,6 +20,7 @@ import (
 	"golang.org/x/mod/semver"
 )
 
+// Config configures a temporary GOPROXY server.
 type Config struct {
 	Upstream string
 	Client   *http.Client
@@ -30,6 +31,7 @@ type Config struct {
 	Verbose  bool
 }
 
+// Server filters only GOPROXY discovery endpoints.
 type Server struct {
 	upstream *url.URL
 	client   *http.Client
@@ -48,14 +50,16 @@ type cachedInfo struct {
 	err  error
 }
 
+// VersionInfo is validated metadata returned by a GOPROXY .info endpoint.
 type VersionInfo struct {
 	Version string
 	Time    time.Time
 }
 
+// New validates configuration and creates a proxy server.
 func New(cfg Config) (*Server, error) {
 	if cfg.Cooldown <= 0 {
-		return nil, fmt.Errorf("cooldown must be positive")
+		return nil, errors.New("cooldown must be positive")
 	}
 	u, err := url.Parse(cfg.Upstream)
 	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
@@ -128,17 +132,14 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, path string)
 		s.writeUpstream(w, status, contentType, body)
 		return
 	}
-	versions, err := parseList(body)
-	if err != nil {
-		s.badGateway(w, fmt.Errorf("invalid upstream list for %s: %w", path, err))
-		return
-	}
+	versions := parseList(body)
 	kept, err := s.filter(r.Context(), path, versions)
 	if err != nil {
 		s.badGateway(w, err)
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	//nolint:gosec // GOPROXY list responses are plain text, not browser-rendered HTML.
 	_, _ = io.WriteString(w, strings.Join(kept, "\n"))
 	if len(kept) > 0 {
 		_, _ = io.WriteString(w, "\n")
@@ -173,7 +174,10 @@ func (s *Server) handleLatest(w http.ResponseWriter, r *http.Request, path strin
 		s.writeUpstream(w, status, contentType, body)
 		return
 	}
+	s.handleLatestFallback(w, r, path)
+}
 
+func (s *Server) handleLatestFallback(w http.ResponseWriter, r *http.Request, path string) {
 	listPath, err := endpoint(path, "/@v/list")
 	if err != nil {
 		s.badGateway(w, err)
@@ -192,11 +196,7 @@ func (s *Server) handleLatest(w http.ResponseWriter, r *http.Request, path strin
 		s.writeUpstream(w, listStatus, "text/plain; charset=utf-8", listBody)
 		return
 	}
-	versions, err := parseList(listBody)
-	if err != nil {
-		s.badGateway(w, fmt.Errorf("invalid upstream list for %s: %w", path, err))
-		return
-	}
+	versions := parseList(listBody)
 	kept, err := s.filter(r.Context(), path, versions)
 	if err != nil {
 		s.badGateway(w, err)
@@ -212,8 +212,14 @@ func (s *Server) handleLatest(w http.ResponseWriter, r *http.Request, path strin
 		s.badGateway(w, err)
 		return
 	}
+	response, err := marshalInfo(info)
+	if err != nil {
+		s.badGateway(w, fmt.Errorf("encode fallback .info for %s@%s: %w", path, chosen, err))
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
-	_, _ = w.Write(mustJSON(info))
+	//nolint:gosec // GOPROXY .info responses are JSON, not browser-rendered HTML.
+	_, _ = w.Write(response)
 }
 
 func (s *Server) filter(ctx context.Context, path string, versions []string) ([]string, error) {
@@ -309,6 +315,7 @@ func (s *Server) fetch(ctx context.Context, rawPath string) ([]byte, int, string
 	if err != nil {
 		return nil, 0, "", err
 	}
+	//nolint:gosec // target is constructed from the validated fixed upstream URL.
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
 		return nil, 0, "", fmt.Errorf("create upstream request: %w", err)
@@ -316,11 +323,12 @@ func (s *Server) fetch(ctx context.Context, rawPath string) ([]byte, int, string
 	if s.verbose {
 		s.logger.Printf("upstream GET %s", target)
 	}
+	//nolint:gosec // req targets only the validated configured upstream.
 	resp, err := s.client.Do(req)
 	if err != nil {
 		return nil, 0, "", fmt.Errorf("upstream request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, 0, "", fmt.Errorf("read upstream response: %w", err)
@@ -334,17 +342,19 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request) {
 		s.badGateway(w, err)
 		return
 	}
+	//nolint:gosec // target is constructed from the validated fixed upstream URL.
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, target, nil)
 	if err != nil {
 		s.badGateway(w, err)
 		return
 	}
+	//nolint:gosec // req targets only the validated configured upstream.
 	resp, err := s.client.Do(req)
 	if err != nil {
 		s.badGateway(w, fmt.Errorf("upstream request: %w", err))
 		return
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	copyHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
@@ -355,6 +365,7 @@ func (s *Server) writeUpstream(w http.ResponseWriter, status int, contentType st
 		w.Header().Set("Content-Type", contentType)
 	}
 	w.WriteHeader(status)
+	//nolint:gosec // The proxy forwards module-protocol bytes, not HTML for browsers.
 	_, _ = w.Write(body)
 }
 func (s *Server) badGateway(w http.ResponseWriter, err error) {
@@ -362,7 +373,7 @@ func (s *Server) badGateway(w http.ResponseWriter, err error) {
 	http.Error(w, "gomod-cooldown: "+err.Error(), http.StatusBadGateway)
 }
 
-func parseList(body []byte) ([]string, error) {
+func parseList(body []byte) []string {
 	lines := strings.Split(strings.ReplaceAll(string(body), "\r\n", "\n"), "\n")
 	versions := make([]string, 0, len(lines))
 	for _, line := range lines {
@@ -372,7 +383,7 @@ func parseList(body []byte) ([]string, error) {
 			versions = append(versions, line)
 		}
 	}
-	return versions, nil
+	return versions
 }
 
 func canonical(v string) bool { return semver.IsValid(v) && module.CanonicalVersion(v) == v }
@@ -396,7 +407,7 @@ func validateInfo(body []byte, requested string) (VersionInfo, error) {
 		return VersionInfo{}, fmt.Errorf("non-canonical Version %q", *raw.Version)
 	}
 	if requested != "" && *raw.Version != requested {
-		return VersionInfo{}, fmt.Errorf("Version %q does not match requested %q", *raw.Version, requested)
+		return VersionInfo{}, fmt.Errorf("version %q does not match requested %q", *raw.Version, requested)
 	}
 	if raw.Time == nil || string(bytes.TrimSpace(*raw.Time)) == "null" {
 		return VersionInfo{}, errors.New("missing Time")
@@ -435,12 +446,15 @@ func chooseVersion(versions []string) string {
 	return bestPre
 }
 
-func mustJSON(info VersionInfo) []byte {
-	b, _ := json.Marshal(struct {
+func marshalInfo(info VersionInfo) ([]byte, error) {
+	result, err := json.Marshal(struct {
 		Version string    `json:"Version"`
 		Time    time.Time `json:"Time"`
 	}{info.Version, info.Time})
-	return b
+	if err != nil {
+		return nil, fmt.Errorf("marshal .info: %w", err)
+	}
+	return result, nil
 }
 
 func (s *Server) upstreamURL(rawPath string) (string, error) {

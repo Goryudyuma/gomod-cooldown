@@ -19,7 +19,7 @@ func TestSnapshotPagesDuplicatesAndBoundary(t *testing.T) {
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
 		if calls == 1 {
-			for i := 0; i < pageLimit; i++ {
+			for i := range pageLimit {
 				fmt.Fprintf(w, `{"Path":"m%d","Version":"v1.0.0","Timestamp":%q}`+"\n", i, cutoff.Add(time.Duration(i+1)*time.Nanosecond).Format(time.RFC3339Nano))
 			}
 			return
@@ -41,7 +41,7 @@ func TestSnapshotFailsClosed(t *testing.T) {
 		"malformed": func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, "not json\n") },
 		"http":      func(w http.ResponseWriter, r *http.Request) { http.Error(w, "no", 500) },
 		"stuck": func(w http.ResponseWriter, r *http.Request) {
-			for i := 0; i < pageLimit; i++ {
+			for range pageLimit {
 				fmt.Fprintf(w, `{"Path":"m","Version":"v1.0.0","Timestamp":%q}`+"\n", cutoff.Format(time.RFC3339Nano))
 			}
 		},

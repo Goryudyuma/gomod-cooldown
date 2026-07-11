@@ -1,0 +1,40 @@
+name: Go formatting
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: go-formatting
+  cancel-in-progress: false
+
+jobs:
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: 1.25.x
+      - uses: golangci/golangci-lint-action@db9de0fc1a667e1a49d2291a1a042dff081d78f6 # v9
+        with:
+          version: v2.12.2
+          install-only: true
+      - run: golangci-lint fmt
+      - uses: dev-hato/actions-diff-pr-management@5cd3792bc98beed11cda90898bc81af6bfa199af # v2.2.5
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          branch-name-prefix: chore/gofmt
+          pr-title-prefix: "chore: apply Go formatting"
+          pr-description-prefix: "Automated formatting changes produced by golangci-lint fmt."
+          exit-failure: false

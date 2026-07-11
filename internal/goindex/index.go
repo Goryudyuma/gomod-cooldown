@@ -5,9 +5,11 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,6 +18,7 @@ import (
 
 const pageLimit = 2000
 
+// Record is one timestamped module-version entry from the index feed.
 type Record struct {
 	Path      string
 	Version   string
@@ -43,61 +46,24 @@ func (f Fetcher) SnapshotForCooldown(ctx context.Context, cooldown time.Duration
 	return recent, cutoff, err
 }
 
+// Snapshot returns every unique module version first cached at or after cutoff.
 func (f Fetcher) Snapshot(ctx context.Context, cutoff time.Time) (map[string]time.Time, error) {
-	base := f.BaseURL
-	if base == "" {
-		base = "https://index.golang.org"
+	u, client, err := f.client()
+	if err != nil {
+		return nil, err
 	}
-	u, err := url.Parse(base)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return nil, fmt.Errorf("invalid index URL %q", base)
-	}
-	client := f.Client
-	if client == nil {
-		client = &http.Client{Timeout: 30 * time.Second}
-	}
-	clientCopy := *client
-	clientCopy.CheckRedirect = func(*http.Request, []*http.Request) error {
-		return http.ErrUseLastResponse
-	}
-	client = &clientCopy
 	// Start one nanosecond before the cutoff so a record exactly at the boundary
 	// cannot be lost if the service treats since as exclusive.
 	cursor := cutoff.Add(-time.Nanosecond).UTC()
 	recent := make(map[string]time.Time)
 	for {
-		q := url.Values{"since": []string{cursor.Format(time.RFC3339Nano)}, "limit": []string{fmt.Sprint(pageLimit)}}
-		reqURL := strings.TrimRight(u.String(), "/") + "/index?" + q.Encode()
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
-		if err != nil {
-			return nil, fmt.Errorf("create index request: %w", err)
-		}
-		resp, err := client.Do(req)
-		if err != nil {
-			return nil, fmt.Errorf("fetch index: %w", err)
-		}
-		if resp.StatusCode != http.StatusOK {
-			resp.Body.Close()
-			return nil, fmt.Errorf("index returned %s", resp.Status)
-		}
-		page, err := decodePage(resp.Body)
-		resp.Body.Close()
+		page, err := fetchPage(ctx, client, u, cursor)
 		if err != nil {
 			return nil, err
 		}
-		var last time.Time
-		for _, r := range page {
-			if r.Path == "" || r.Version == "" || r.Timestamp.IsZero() {
-				return nil, fmt.Errorf("invalid index record")
-			}
-			if r.Timestamp.Before(cutoff) {
-				continue
-			}
-			key := availability.Key(r.Path, r.Version)
-			if old, ok := recent[key]; !ok || r.Timestamp.Before(old) {
-				recent[key] = r.Timestamp
-			}
-			last = r.Timestamp
+		last, err := addRecent(recent, page, cutoff)
+		if err != nil {
+			return nil, err
 		}
 		if len(page) < pageLimit {
 			return recent, nil
@@ -109,7 +75,65 @@ func (f Fetcher) Snapshot(ctx context.Context, cutoff time.Time) (map[string]tim
 	}
 }
 
-func decodePage(body interface{ Read([]byte) (int, error) }) ([]Record, error) {
+func (f Fetcher) client() (*url.URL, *http.Client, error) {
+	base := f.BaseURL
+	if base == "" {
+		base = "https://index.golang.org"
+	}
+	u, err := url.Parse(base)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return nil, nil, fmt.Errorf("invalid index URL %q", base)
+	}
+	client := f.Client
+	if client == nil {
+		client = &http.Client{Timeout: 30 * time.Second}
+	}
+	clientCopy := *client
+	clientCopy.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	return u, &clientCopy, nil
+}
+
+func fetchPage(ctx context.Context, client *http.Client, base *url.URL, cursor time.Time) ([]Record, error) {
+	q := url.Values{"since": []string{cursor.Format(time.RFC3339Nano)}, "limit": []string{strconv.Itoa(pageLimit)}}
+	reqURL := strings.TrimRight(base.String(), "/") + "/index?" + q.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create index request: %w", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetch index: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("index returned %s", resp.Status)
+	}
+	return decodePage(resp.Body)
+}
+
+func addRecent(recent map[string]time.Time, page []Record, cutoff time.Time) (time.Time, error) {
+	var last time.Time
+	for _, r := range page {
+		if r.Path == "" || r.Version == "" || r.Timestamp.IsZero() {
+			return time.Time{}, errors.New("invalid index record")
+		}
+		if r.Timestamp.Before(cutoff) {
+			continue
+		}
+		key := availability.Key(r.Path, r.Version)
+		if old, ok := recent[key]; !ok || r.Timestamp.Before(old) {
+			recent[key] = r.Timestamp
+		}
+		last = r.Timestamp
+	}
+	return last, nil
+}
+
+func decodePage(body interface {
+	Read(p []byte) (n int, err error)
+}) ([]Record, error) {
 	s := bufio.NewScanner(body)
 	// Index records are small, but do not make a silently small Scanner limit.
 	s.Buffer(make([]byte, 4096), 1024*1024)
@@ -117,7 +141,7 @@ func decodePage(body interface{ Read([]byte) (int, error) }) ([]Record, error) {
 	for s.Scan() {
 		line := strings.TrimSpace(s.Text())
 		if line == "" {
-			return nil, fmt.Errorf("invalid empty index record")
+			return nil, errors.New("invalid empty index record")
 		}
 		var r Record
 		if err := json.Unmarshal([]byte(line), &r); err != nil {

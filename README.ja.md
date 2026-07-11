@@ -113,10 +113,14 @@ go mod tidy
 go test ./...
 go vet ./...
 go test -race ./...
+golangci-lint run
+golangci-lint fmt
 ```
 
 テストは `httptest.Server`、inject可能なHTTP clientとclockを使うため、外部networkに
 依存しません。
+GitHub Actionsはテスト、race検出、vet、`golangci-lint`を実行します。リポジトリ内の
+PRでは別ワークフローが`gofmt`/`goimports`を実行し、安全な差分があれば整形用PRを作成・更新します。
 
 ## ライセンスと第三者通知
 

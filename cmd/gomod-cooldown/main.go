@@ -1,3 +1,4 @@
+// gomod-cooldown filters Go module version discovery for a child command.
 package main
 
 import (

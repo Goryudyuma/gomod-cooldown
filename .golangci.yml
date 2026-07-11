@@ -1,0 +1,66 @@
+version: "2"
+
+run:
+  tests: true
+
+linters:
+  default: all
+  # Disabled linters either target dependencies not used by this project or
+  # require a project-specific policy that this small CLI intentionally has not
+  # adopted. All other golangci-lint v2 linters remain enabled.
+  disable:
+    - arangolint
+    - clickhouselint
+    - contextcheck
+    - cyclop
+    - depguard
+    - err113
+    - exhaustruct
+    - forbidigo
+    - ginkgolinter
+    - gochecknoglobals
+    - gocognit
+    - goheader
+    - gomodguard
+    - gomodguard_v2
+    - goprintffuncname
+    - importas
+    - ireturn
+    - lll
+    - loggercheck
+    - mnd
+    - musttag
+    - nlreturn
+    - noinlineerr
+    - paralleltest
+    - prealloc
+    - promlinter
+    - protogetter
+    - sloglint
+    - spancheck
+    - sqlclosecheck
+    - tagalign
+    - tagliatelle
+    - testifylint
+    - testpackage
+    - tparallel
+    - varnamelen
+    - wsl
+    - wsl_v5
+    - zerologlint
+  exclusions:
+    generated: strict
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck
+          - goconst
+          - gosec
+          - noctx
+          - revive
+          - usestdlibvars
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

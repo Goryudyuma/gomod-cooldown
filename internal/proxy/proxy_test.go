@@ -209,6 +209,7 @@ func newTestServer(t *testing.T, upstream string, source availability.Source) *S
 	return s
 }
 func fakeProxy(t *testing.T, data map[string]string) *httptest.Server {
+	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if v, ok := data[r.URL.Path]; ok {
 			w.Header().Set("Content-Type", "application/json")

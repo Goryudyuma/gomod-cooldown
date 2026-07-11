@@ -30,8 +30,8 @@ func TestParseCooldown(t *testing.T) {
 
 func TestParseAndEnvironment(t *testing.T) {
 	var errout bytes.Buffer
-	o, err := Parse([]string{"--cooldown=7d", "--time-source=commit", "--", "echo", "x"}, &errout)
-	if err != nil || o.Cooldown != 7*24*time.Hour || o.Command[0] != "echo" {
+	o, err := Parse([]string{"--cooldown=7d", "--", "echo", "x"}, &errout)
+	if err != nil || o.Cooldown != 7*24*time.Hour || o.TimeSource != "commit" || o.Command[0] != "echo" {
 		t.Fatal(o, err)
 	}
 	for _, args := range [][]string{{}, {"--cooldown=0", "--", "x"}, {"--", ""}} {
@@ -69,7 +69,7 @@ func TestRunConnectsStandardStreamsAndDoesNotStartAfterSetupFailure(t *testing.T
 	}
 	out.Reset()
 	err.Reset()
-	code = Run(context.Background(), []string{"--upstream=http://example.invalid", "--", "sh", "-c", "exit 7"}, nil, &out, &err)
+	code = Run(context.Background(), []string{"--time-source=combined", "--upstream=http://example.invalid", "--", "sh", "-c", "exit 7"}, nil, &out, &err)
 	if code != 1 || strings.Contains(err.String(), "exit status 7") {
 		t.Fatalf("code=%d err=%q", code, err.String())
 	}

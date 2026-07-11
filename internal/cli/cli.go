@@ -48,7 +48,7 @@ func Parse(args []string, stderr io.Writer) (Options, error) {
 	fs.SetOutput(stderr)
 	cooldown := fs.String("cooldown", "14d", "minimum availability age")
 	upstream := fs.String("upstream", "https://proxy.golang.org", "upstream GOPROXY URL")
-	timeSource := fs.String("time-source", "combined", "availability source: combined or commit")
+	timeSource := fs.String("time-source", "commit", "availability source: commit (default) or combined")
 	timeout := fs.Duration("upstream-timeout", 30*time.Second, "upstream HTTP timeout")
 	verbose := fs.Bool("verbose", false, "log upstream requests and decisions")
 	if err := fs.Parse(args[:sep]); err != nil {

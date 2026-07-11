@@ -36,8 +36,9 @@ gomod-cooldown --cooldown=14d -- go get -u all
 - `--cooldown=14d`: Goのduration形式に加えて、`d` を厳密に24時間として受け付けます。
   例: `168h`、`7d`、`14d12h`。正の値が必要です。
 - `--upstream=https://proxy.golang.org`: 単一の固定upstream GOPROXYを指定します。
-- `--time-source=combined`: 既定値です。commit timeとindex timestampの両方を使います。
-  `commit` を指定すると `.info.Time` だけを使います。
+- `--time-source=commit`: 既定値です。`.info.Time` だけを使い、通常のGo commandと
+  同じくmodule単位のdiscovery requestだけで完了します。`combined` はindex timestampも
+  使う、高コストの明示opt-inモードです。
 - `--upstream-timeout=30s`: upstream HTTP requestのタイムアウトです。
 - `--verbose`: upstream requestと判定の詳細を出力します。
 
@@ -60,14 +61,19 @@ discovery endpointが返す404が後段proxyで迂回されないようにする
 ## availability time
 
 `.info.Time` はcommit timeであり、公開日時ではありません。新しいtagが古いcommitを
-指すことがあるためです。公式の `index.golang.org` feedには、module versionが
-`proxy.golang.org` に最初にcacheされた時刻が含まれます。このfirst-cached timeは
-availability timeとして扱いますが、厳密なtag公開日時ではありません。
+指すことがあるためです。既定値がcommit modeなのは、module単位のproxy requestだけで
+判定でき、対話的なCLI利用でも実用的だからです。
 
-`--time-source=combined` では、起動時にcutoff直前から現在までの時系列index feedを
-`since` と `limit=2000` で最終short pageまで読み切ります。不正record、HTTP失敗、
-timeout、cursorの進行停止はfail closedで扱い、commit timeだけへ黙ってfallbackしません。
-このモードでは正確に `https://proxy.golang.org` をupstreamとして指定する必要があります。
+公式の `index.golang.org` feedには、module versionが `proxy.golang.org` に最初にcache
+された時刻が含まれます。このfirst-cached timeはavailability timeとして扱いますが、
+厳密なtag公開日時ではありません。
+
+`--time-source=combined` は明示opt-inです。indexにはmodule単位のlookup APIがないため、
+起動時にcutoff直前から現在までの時系列global feedを `since` と `limit=2000` で最終short
+pageまで読み切ります。cooldown期間が長いと時間がかかることがあります。不正record、
+HTTP失敗、timeout、cursorの進行停止はfail closedで扱い、commit timeだけへ黙ってfallback
+しません。このモードでは正確に `https://proxy.golang.org` をupstreamとして指定する必要が
+あります。
 
 候補versionごとの判定は次のとおりです。
 

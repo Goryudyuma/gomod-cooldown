@@ -36,8 +36,9 @@ Flags:
 - `--cooldown=14d` accepts Go durations plus `d` as exactly 24 hours (for
   example `168h`, `7d`, or `14d12h`). It must be positive.
 - `--upstream=https://proxy.golang.org` selects the single fixed upstream.
-- `--time-source=combined` (default) uses both commit and index timestamps;
-  `commit` uses only `.info.Time`.
+- `--time-source=commit` (default) uses only `.info.Time` and has the same
+  per-module discovery shape as normal Go commands. `combined` is an explicit,
+  high-cost mode that also uses index timestamps.
 - `--upstream-timeout=30s` bounds upstream HTTP requests.
 - `--verbose` emits upstream-request and decision diagnostics.
 
@@ -62,15 +63,20 @@ cooldown via a later proxy.
 ## Availability time
 
 `.info.Time` is a commit time, not a publish time: a new tag can point at an old
-commit. The official `index.golang.org` feed supplies the time a module version
-was first cached by `proxy.golang.org`. That first-cached time is an availability
+commit. This is the default availability source because it only requires
+per-module proxy requests and remains practical for interactive use.
+
+The official `index.golang.org` feed supplies the time a module version was
+first cached by `proxy.golang.org`. That first-cached time is an availability
 time, not an exact tag publish time.
 
-With `--time-source=combined`, startup reads the complete chronological index
-feed from the cutoff through the present using `since` and `limit=2000`, paging
-until the final short page. A malformed record, HTTP failure, timeout, or cursor
-that does not advance fails setup closed; it never silently falls back to commit
-time. This mode requires the exact official `https://proxy.golang.org` upstream.
+`--time-source=combined` is deliberately opt-in. The index has no per-module
+lookup API, so startup reads the complete chronological global feed from the
+cutoff through the present using `since` and `limit=2000`, paging until the final
+short page. It can take a long time for a large cooldown window. A malformed
+record, HTTP failure, timeout, or cursor that does not advance fails setup closed;
+it never silently falls back to commit time. This mode requires the exact
+official `https://proxy.golang.org` upstream.
 
 For each discovery candidate:
 

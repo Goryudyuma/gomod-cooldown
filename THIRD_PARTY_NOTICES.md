@@ -1,7 +1,7 @@
 # Third-party notices
 
 This project statically includes the Go standard library and links
-`golang.org/x/mod v0.26.0`; the following Go Authors BSD 3-Clause notice applies:
+`golang.org/x/mod v0.37.0`; the following Go Authors BSD 3-Clause notice applies:
 
 ```text
 Copyright 2009 The Go Authors.

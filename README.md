@@ -60,6 +60,11 @@ The wrapper intentionally does not append `https://proxy.golang.org,direct` (or
 any fallback) to the child's `GOPROXY`: a discovery 404 must not bypass the
 cooldown via a later proxy.
 
+Validated `.info` metadata used for version decisions is cached in memory and
+reused only for the lifetime of one CLI invocation. The cache is discarded at
+exit and is not carried into the next invocation. The mutable `@v/list` and
+`@latest` responses themselves are fetched from the upstream for every request.
+
 ## Availability time
 
 `.info.Time` is a commit time, not a publish time: a new tag can point at an old
@@ -124,6 +129,10 @@ golangci-lint fmt
 ```
 
 Tests use `httptest.Server`, injected clients/clocks, and no external network.
+End-to-end cases run the real Go command against a local fake GOPROXY. They also
+exercise byte-for-byte, fixed-commit `go.mod` snapshots from Prometheus, Helm,
+and Caddy; fixture provenance is recorded in
+[`internal/cli/testdata/large-modules`](internal/cli/testdata/large-modules).
 GitHub Actions runs tests, race detection, vet, and `golangci-lint`. For an
 in-repository pull request, a separate workflow runs `gofmt`/`goimports` and
 opens or updates a formatting pull request when safe changes are available.
@@ -131,7 +140,8 @@ opens or updates a formatting pull request when safe changes are available.
 ## License and notices
 
 This project is licensed under [Apache License 2.0](LICENSE). See
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for bundled dependency notices.
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for bundled dependency and test
+fixture notices.
 
 ## Inspiration
 

@@ -58,6 +58,10 @@ gomod-cooldown --cooldown=14d -- go get -u all
 子プロセスの `GOPROXY` に `https://proxy.golang.org,direct` などのfallbackは追加しません。
 discovery endpointが返す404が後段proxyで迂回されないようにするためです。
 
+version判定用に検証済みの `.info` metadataは、1回のCLI実行中だけmemoryにcacheして
+再利用します。cacheは終了時に破棄され、次回起動には引き継ぎません。変化し得る
+`@v/list` と `@latest` 自体はcacheせず、requestごとにupstreamから取得します。
+
 ## availability time
 
 `.info.Time` はcommit timeであり、公開日時ではありません。新しいtagが古いcommitを
@@ -118,14 +122,17 @@ golangci-lint fmt
 ```
 
 テストは `httptest.Server`、inject可能なHTTP clientとclockを使うため、外部networkに
-依存しません。
+依存しません。E2Eでは本物のGo commandをローカルfake GOPROXYに対して実行します。
+また、Prometheus、Helm、Caddyの固定commitからbyte-for-byteで取得した `go.mod` も
+検証します。fixtureの出典は
+[`internal/cli/testdata/large-modules`](internal/cli/testdata/large-modules) に記録しています。
 GitHub Actionsはテスト、race検出、vet、`golangci-lint`を実行します。リポジトリ内の
 PRでは別ワークフローが`gofmt`/`goimports`を実行し、安全な差分があれば整形用PRを作成・更新します。
 
 ## ライセンスと第三者通知
 
-このプロジェクトは [Apache License 2.0](LICENSE) で提供されます。静的リンクする
-依存関係の通知は [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) を参照してください。
+このプロジェクトは [Apache License 2.0](LICENSE) で提供されます。同梱する依存関係と
+test fixtureの通知は [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) を参照してください。
 
 ## Inspiration
 

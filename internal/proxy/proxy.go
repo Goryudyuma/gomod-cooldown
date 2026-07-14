@@ -41,13 +41,20 @@ type Server struct {
 	logger   *log.Logger
 	verbose  bool
 
-	cacheMu sync.Mutex
-	infos   map[string]cachedInfo
+	cacheMu  sync.Mutex
+	infos    map[string]cachedInfo
+	inflight map[string]*infoCall
 }
 
 type cachedInfo struct {
 	info VersionInfo
 	err  error
+}
+
+type infoCall struct {
+	done         chan struct{}
+	result       cachedInfo
+	retryWaiters bool
 }
 
 // VersionInfo is validated metadata returned by a GOPROXY .info endpoint.
@@ -83,7 +90,17 @@ func New(cfg Config) (*Server, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = log.New(io.Discard, "", 0)
 	}
-	return &Server{upstream: u, client: &client, source: cfg.Source, cooldown: cfg.Cooldown, now: cfg.Now, logger: cfg.Logger, verbose: cfg.Verbose, infos: make(map[string]cachedInfo)}, nil
+	return &Server{
+		upstream: u,
+		client:   &client,
+		source:   cfg.Source,
+		cooldown: cfg.Cooldown,
+		now:      cfg.Now,
+		logger:   cfg.Logger,
+		verbose:  cfg.Verbose,
+		infos:    make(map[string]cachedInfo),
+		inflight: make(map[string]*infoCall),
+	}, nil
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -92,11 +109,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "only GET is supported", http.StatusMethodNotAllowed)
 		return
 	}
-	if mod, ok := moduleFor(r.URL.EscapedPath(), "/@v/list"); ok {
+	// net/http decodes URL escaping in Path. Real Go clients percent-encode the
+	// exclamation marks used by the module proxy protocol for uppercase letters.
+	if mod, ok := moduleFor(r.URL.Path, "/@v/list"); ok {
 		s.handleList(w, r, mod)
 		return
 	}
-	if mod, ok := moduleFor(r.URL.EscapedPath(), "/@latest"); ok {
+	if mod, ok := moduleFor(r.URL.Path, "/@latest"); ok {
 		s.handleLatest(w, r, mod)
 		return
 	}
@@ -267,39 +286,60 @@ func (s *Server) allowed(ctx context.Context, path string, info VersionInfo) (bo
 
 func (s *Server) info(ctx context.Context, path, version string) (VersionInfo, error) {
 	key := path + "\x00" + version
-	s.cacheMu.Lock()
-	c, ok := s.infos[key]
-	s.cacheMu.Unlock()
-	if ok {
+	for {
+		s.cacheMu.Lock()
+		c, ok := s.infos[key]
+		if ok {
+			s.cacheMu.Unlock()
+			return c.info, c.err
+		}
+		if call, exists := s.inflight[key]; exists {
+			s.cacheMu.Unlock()
+			select {
+			case <-call.done:
+				if call.retryWaiters && ctx.Err() == nil {
+					continue
+				}
+				return call.result.info, call.result.err
+			case <-ctx.Done():
+				return VersionInfo{}, fmt.Errorf("wait for .info for %s@%s: %w", path, version, ctx.Err())
+			}
+		}
+		call := &infoCall{done: make(chan struct{})}
+		s.inflight[key] = call
+		s.cacheMu.Unlock()
+
+		c = s.fetchInfo(ctx, path, version)
+		s.cacheMu.Lock()
+		if c.err == nil {
+			s.infos[key] = c
+		}
+		call.result = c
+		call.retryWaiters = ctx.Err() != nil && errors.Is(c.err, ctx.Err())
+		delete(s.inflight, key)
+		close(call.done)
+		s.cacheMu.Unlock()
 		return c.info, c.err
 	}
+}
+
+func (s *Server) fetchInfo(ctx context.Context, path, version string) cachedInfo {
 	p, err := endpoint(path, "/@v/"+version+".info")
+	if err != nil {
+		return cachedInfo{err: err}
+	}
+	body, status, _, err := s.fetch(ctx, p)
+	if err == nil && status != http.StatusOK {
+		err = fmt.Errorf("upstream .info for %s@%s returned %d", path, version, status)
+	}
+	var info VersionInfo
 	if err == nil {
-		var body []byte
-		var status int
-		body, status, _, err = s.fetch(ctx, p)
-		if err == nil && status != http.StatusOK {
-			err = fmt.Errorf("upstream .info for %s@%s returned %d", path, version, status)
-		}
-		var info VersionInfo
-		if err == nil {
-			info, err = validateInfo(body, version)
-		}
-		if err != nil {
-			err = fmt.Errorf("get .info for %s@%s: %w", path, version, err)
-		}
-		c = cachedInfo{info: info, err: err}
-	} else {
-		c = cachedInfo{err: err}
+		info, err = validateInfo(body, version)
 	}
-	s.cacheMu.Lock()
-	if old, exists := s.infos[key]; exists {
-		c = old
-	} else {
-		s.infos[key] = c
+	if err != nil {
+		err = fmt.Errorf("get .info for %s@%s: %w", path, version, err)
 	}
-	s.cacheMu.Unlock()
-	return c.info, c.err
+	return cachedInfo{info: info, err: err}
 }
 
 func endpoint(path, suffix string) (string, error) {

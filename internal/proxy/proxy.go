@@ -324,7 +324,7 @@ func (s *Server) info(ctx context.Context, path, version string) (VersionInfo, e
 }
 
 func (s *Server) fetchInfo(ctx context.Context, path, version string) cachedInfo {
-	p, err := endpoint(path, "/@v/"+version+".info")
+	p, err := versionEndpoint(path, version, ".info")
 	if err != nil {
 		return cachedInfo{err: err}
 	}
@@ -348,6 +348,14 @@ func endpoint(path, suffix string) (string, error) {
 		return "", fmt.Errorf("escape module path %q: %w", path, err)
 	}
 	return "/" + escaped + suffix, nil
+}
+
+func versionEndpoint(path, version, suffix string) (string, error) {
+	escaped, err := module.EscapeVersion(version)
+	if err != nil {
+		return "", fmt.Errorf("escape module version %q: %w", version, err)
+	}
+	return endpoint(path, "/@v/"+escaped+suffix)
 }
 
 func (s *Server) fetch(ctx context.Context, rawPath string) ([]byte, int, string, error) {

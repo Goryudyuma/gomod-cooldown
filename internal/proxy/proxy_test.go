@@ -109,6 +109,271 @@ func TestListEscapesUppercaseVersionForUpstream(t *testing.T) {
 	}
 }
 
+func TestListSkipsUnavailableVersionsReportedByOfficialProxy(t *testing.T) {
+	tests := []struct {
+		name     string
+		listPath string
+		infoPath string
+		version  string
+	}{
+		{
+			name: "cloud.google.com/go/storage@v1.35.0", listPath: "/cloud.google.com/go/storage/@v/list",
+			infoPath: "/cloud.google.com/go/storage/@v/v1.35.0.info", version: "v1.35.0",
+		},
+		{
+			name: "github.com/Masterminds/semver/v3@v3.0.0", listPath: "/github.com/!masterminds/semver/v3/@v/list",
+			infoPath: "/github.com/!masterminds/semver/v3/@v/v3.0.0.info", version: "v3.0.0",
+		},
+		{
+			name: "github.com/go-gorp/gorp/v3@v3.0.0", listPath: "/github.com/go-gorp/gorp/v3/@v/list",
+			infoPath: "/github.com/go-gorp/gorp/v3/@v/v3.0.0.info", version: "v3.0.0",
+		},
+		{
+			name: "github.com/gocraft/dbr/v2@v2.6.1", listPath: "/github.com/gocraft/dbr/v2/@v/list",
+			infoPath: "/github.com/gocraft/dbr/v2/@v/v2.6.1.info", version: "v2.6.1",
+		},
+		{
+			name: "github.com/googleapis/gax-go/v2@v2.0.0", listPath: "/github.com/googleapis/gax-go/v2/@v/list",
+			infoPath: "/github.com/googleapis/gax-go/v2/@v/v2.0.0.info", version: "v2.0.0",
+		},
+		{
+			name: "github.com/oklog/ulid/v2@v2.0.0", listPath: "/github.com/oklog/ulid/v2/@v/list",
+			infoPath: "/github.com/oklog/ulid/v2/@v/v2.0.0.info", version: "v2.0.0",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var infoCalls atomic.Int32
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case tt.listPath:
+					_, _ = io.WriteString(w, tt.version+"\n")
+				case tt.infoPath:
+					infoCalls.Add(1)
+					http.NotFound(w, r)
+				default:
+					http.Error(w, "unexpected path", http.StatusInternalServerError)
+				}
+			}))
+			defer up.Close()
+			s := newTestServer(t, up.URL, availability.CommitTimeSource{})
+
+			r := httptest.NewRecorder()
+			s.ServeHTTP(r, httptest.NewRequest(http.MethodGet, tt.listPath, nil))
+			if r.Code != http.StatusOK || r.Body.String() != "" || infoCalls.Load() != 1 {
+				t.Fatalf("status=%d body=%q info calls=%d", r.Code, r.Body.String(), infoCalls.Load())
+			}
+		})
+	}
+}
+
+func TestListSkipsOnlyUnavailableInfoStatuses(t *testing.T) {
+	for _, tt := range []struct {
+		status int
+		want   int
+	}{
+		{status: http.StatusGone, want: http.StatusOK},
+		{status: http.StatusFound, want: http.StatusBadGateway},
+		{status: http.StatusBadRequest, want: http.StatusBadGateway},
+		{status: http.StatusForbidden, want: http.StatusBadGateway},
+		{status: http.StatusTooManyRequests, want: http.StatusBadGateway},
+		{status: http.StatusInternalServerError, want: http.StatusBadGateway},
+	} {
+		t.Run(http.StatusText(tt.status), func(t *testing.T) {
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/example.com/m/@v/list" {
+					_, _ = io.WriteString(w, "v1.0.0\n")
+					return
+				}
+				http.Error(w, http.StatusText(tt.status), tt.status)
+			}))
+			defer up.Close()
+			s := newTestServer(t, up.URL, availability.CommitTimeSource{})
+
+			r := httptest.NewRecorder()
+			s.ServeHTTP(r, httptest.NewRequest(http.MethodGet, "/example.com/m/@v/list", nil))
+			if r.Code != tt.want {
+				t.Fatalf("status=%d body=%q, want %d", r.Code, r.Body.String(), tt.want)
+			}
+		})
+	}
+}
+
+func TestUnavailableInfoIsCachedOnlyForServerLifetime(t *testing.T) {
+	for _, status := range []int{http.StatusNotFound, http.StatusGone} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			var infoCalls atomic.Int32
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/example.com/m/@v/list" {
+					_, _ = io.WriteString(w, "v1.0.0\n")
+					return
+				}
+				infoCalls.Add(1)
+				http.Error(w, http.StatusText(status), status)
+			}))
+			defer up.Close()
+
+			s := newTestServer(t, up.URL, availability.CommitTimeSource{})
+			for range 2 {
+				r := httptest.NewRecorder()
+				s.ServeHTTP(r, httptest.NewRequest(http.MethodGet, "/example.com/m/@v/list", nil))
+				if r.Code != http.StatusOK || r.Body.String() != "" {
+					t.Fatalf("status=%d body=%q", r.Code, r.Body.String())
+				}
+			}
+			if infoCalls.Load() != 1 {
+				t.Fatalf("same server info calls=%d", infoCalls.Load())
+			}
+
+			r := httptest.NewRecorder()
+			newTestServer(t, up.URL, availability.CommitTimeSource{}).ServeHTTP(r, httptest.NewRequest(http.MethodGet, "/example.com/m/@v/list", nil))
+			if r.Code != http.StatusOK || infoCalls.Load() != 2 {
+				t.Fatalf("new server status=%d total info calls=%d", r.Code, infoCalls.Load())
+			}
+		})
+	}
+}
+
+func TestListSuppressesHigherIncompatibleOnlyForModuleAwareVersionInCooldown(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		goMod   string
+		want    string
+		modCall int32
+	}{
+		{name: "module aware", goMod: "module example.com/m\n\ngo 1.20\n", want: "v1.0.0\n", modCall: 1},
+		{name: "legacy synthetic go.mod", goMod: "module example.com/m\n", want: "v1.0.0\nv2.0.0-preview.1+incompatible\n", modCall: 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var modCalls atomic.Int32
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/example.com/m/@v/list":
+					_, _ = io.WriteString(w, "v1.0.0\nv1.1.0\nv2.0.0-preview.1+incompatible\n")
+				case "/example.com/m/@v/v1.0.0.info":
+					_, _ = io.WriteString(w, info("v1.0.0", now.Add(-30*24*time.Hour)))
+				case "/example.com/m/@v/v1.1.0.info":
+					_, _ = io.WriteString(w, info("v1.1.0", now.Add(-time.Hour)))
+				case "/example.com/m/@v/v2.0.0-preview.1+incompatible.info":
+					_, _ = io.WriteString(w, info("v2.0.0-preview.1+incompatible", now.Add(-30*24*time.Hour)))
+				case "/example.com/m/@v/v1.1.0.mod":
+					modCalls.Add(1)
+					_, _ = io.WriteString(w, tt.goMod)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer up.Close()
+			s := newTestServer(t, up.URL, availability.CommitTimeSource{})
+
+			for range 2 {
+				r := httptest.NewRecorder()
+				s.ServeHTTP(r, httptest.NewRequest(http.MethodGet, "/example.com/m/@v/list", nil))
+				if r.Code != http.StatusOK || r.Body.String() != tt.want {
+					t.Fatalf("status=%d body=%q, want %q", r.Code, r.Body.String(), tt.want)
+				}
+			}
+			if modCalls.Load() != tt.modCall {
+				t.Fatalf(".mod calls=%d, want %d", modCalls.Load(), tt.modCall)
+			}
+
+			r := httptest.NewRecorder()
+			newTestServer(t, up.URL, availability.CommitTimeSource{}).ServeHTTP(r, httptest.NewRequest(http.MethodGet, "/example.com/m/@v/list", nil))
+			if r.Code != http.StatusOK || r.Body.String() != tt.want || modCalls.Load() != tt.modCall+1 {
+				t.Fatalf("new server status=%d body=%q total .mod calls=%d", r.Code, r.Body.String(), modCalls.Load())
+			}
+		})
+	}
+}
+
+func TestListUsesHighestUsableCompatibleWhenNewerVersionIsUnavailable(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/example.com/m/@v/list":
+			_, _ = io.WriteString(w, "v1.0.0\nv1.1.0\nv1.2.0\nv2.0.0-preview.1+incompatible\n")
+		case "/example.com/m/@v/v1.0.0.info":
+			_, _ = io.WriteString(w, info("v1.0.0", now.Add(-30*24*time.Hour)))
+		case "/example.com/m/@v/v1.1.0.info":
+			_, _ = io.WriteString(w, info("v1.1.0", now.Add(-time.Hour)))
+		case "/example.com/m/@v/v1.2.0.info":
+			http.NotFound(w, r)
+		case "/example.com/m/@v/v2.0.0-preview.1+incompatible.info":
+			_, _ = io.WriteString(w, info("v2.0.0-preview.1+incompatible", now.Add(-30*24*time.Hour)))
+		case "/example.com/m/@v/v1.1.0.mod":
+			_, _ = io.WriteString(w, "module example.com/m\n\ngo 1.20\n")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer up.Close()
+	s := newTestServer(t, up.URL, availability.CommitTimeSource{})
+
+	r := httptest.NewRecorder()
+	s.ServeHTTP(r, httptest.NewRequest(http.MethodGet, "/example.com/m/@v/list", nil))
+	if r.Code != http.StatusOK || r.Body.String() != "v1.0.0\n" {
+		t.Fatalf("status=%d body=%q", r.Code, r.Body.String())
+	}
+}
+
+func TestListLeavesHigherIncompatibleWhenLatestCompatibleIsEligible(t *testing.T) {
+	var modCalls atomic.Int32
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/example.com/m/@v/list":
+			_, _ = io.WriteString(w, "v1.0.0-beta.1\nv1.0.0\nv2.0.0-preview.1+incompatible\n")
+		case "/example.com/m/@v/v1.0.0-beta.1.info":
+			_, _ = io.WriteString(w, info("v1.0.0-beta.1", now.Add(-30*24*time.Hour)))
+		case "/example.com/m/@v/v1.0.0.info":
+			_, _ = io.WriteString(w, info("v1.0.0", now.Add(-30*24*time.Hour)))
+		case "/example.com/m/@v/v2.0.0-preview.1+incompatible.info":
+			_, _ = io.WriteString(w, info("v2.0.0-preview.1+incompatible", now.Add(-30*24*time.Hour)))
+		case "/example.com/m/@v/v1.0.0.mod":
+			modCalls.Add(1)
+			http.Error(w, "must not be fetched", http.StatusInternalServerError)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer up.Close()
+	s := newTestServer(t, up.URL, availability.CommitTimeSource{})
+
+	r := httptest.NewRecorder()
+	s.ServeHTTP(r, httptest.NewRequest(http.MethodGet, "/example.com/m/@v/list", nil))
+	want := "v1.0.0-beta.1\nv1.0.0\nv2.0.0-preview.1+incompatible\n"
+	if r.Code != http.StatusOK || r.Body.String() != want || modCalls.Load() != 0 {
+		t.Fatalf("status=%d body=%q .mod calls=%d", r.Code, r.Body.String(), modCalls.Load())
+	}
+}
+
+func TestModuleAwarenessFailureFailsClosed(t *testing.T) {
+	for _, status := range []int{http.StatusNotFound, http.StatusInternalServerError} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/example.com/m/@v/list":
+					_, _ = io.WriteString(w, "v1.0.0\nv2.0.0-preview.1+incompatible\n")
+				case "/example.com/m/@v/v1.0.0.info":
+					_, _ = io.WriteString(w, info("v1.0.0", now.Add(-time.Hour)))
+				case "/example.com/m/@v/v2.0.0-preview.1+incompatible.info":
+					_, _ = io.WriteString(w, info("v2.0.0-preview.1+incompatible", now.Add(-30*24*time.Hour)))
+				case "/example.com/m/@v/v1.0.0.mod":
+					http.Error(w, http.StatusText(status), status)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer up.Close()
+			s := newTestServer(t, up.URL, availability.CommitTimeSource{})
+
+			r := httptest.NewRecorder()
+			s.ServeHTTP(r, httptest.NewRequest(http.MethodGet, "/example.com/m/@v/list", nil))
+			if r.Code != http.StatusBadGateway {
+				t.Fatalf("status=%d body=%q", r.Code, r.Body.String())
+			}
+		})
+	}
+}
+
 func TestPassthroughNeverChecksAvailability(t *testing.T) {
 	var source callsSource
 	up := fakeProxy(t, map[string]string{"/example.com/m/@v/v1.9.0.info": info("v1.9.0", now), "/example.com/m/@v/v1.9.0.mod": "module example.com/m\n", "/example.com/m/@v/v1.9.0.zip": "zip"})
@@ -123,6 +388,29 @@ func TestPassthroughNeverChecksAvailability(t *testing.T) {
 	}
 	if source.n.Load() != 0 {
 		t.Fatal("availability source was called")
+	}
+}
+
+func TestPassthroughPreservesUnavailableInfoStatus(t *testing.T) {
+	for _, status := range []int{http.StatusNotFound, http.StatusGone} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			const body = `{"error":"unavailable"}`
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/problem+json")
+				w.Header().Set("ETag", `"missing"`)
+				w.WriteHeader(status)
+				_, _ = io.WriteString(w, body)
+			}))
+			defer up.Close()
+			s := newTestServer(t, up.URL, availability.CommitTimeSource{})
+
+			r := httptest.NewRecorder()
+			s.ServeHTTP(r, httptest.NewRequest(http.MethodGet, "/example.com/m/@v/v1.0.0.info", nil))
+			if r.Code != status || r.Body.String() != body ||
+				r.Header().Get("Content-Type") != "application/problem+json" || r.Header().Get("ETag") != `"missing"` {
+				t.Fatalf("status=%d headers=%v body=%q", r.Code, r.Header(), r.Body.String())
+			}
+		})
 	}
 }
 
@@ -179,7 +467,11 @@ func TestLatestFallback(t *testing.T) {
 			if tt.name == "old-latest" {
 				latestTime = now.Add(-20 * 24 * time.Hour)
 			}
-			m := map[string]string{"/example.com/m/@latest": info("v9.0.0", latestTime), "/example.com/m/@v/list": tt.list}
+			m := map[string]string{
+				"/example.com/m/@latest":        info("v9.0.0", latestTime),
+				"/example.com/m/@v/list":        tt.list,
+				"/example.com/m/@v/v9.0.0.info": info("v9.0.0", latestTime),
+			}
 			for _, v := range []string{"v1.0.0", "v2.0.0-beta.1", "v1.0.0-beta.1", "v1.0.0-rc.1"} {
 				m["/example.com/m/@v/"+v+".info"] = info(v, now.Add(-20*24*time.Hour))
 			}
@@ -194,6 +486,99 @@ func TestLatestFallback(t *testing.T) {
 				}
 			} else if r.Code != 200 || !bytes.Contains(r.Body.Bytes(), []byte(tt.want)) {
 				t.Fatalf("%d %s", r.Code, r.Body.String())
+			}
+		})
+	}
+}
+
+func TestLatestFallbackSkipsUnavailableListedVersion(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/example.com/m/@latest":
+			_, _ = io.WriteString(w, info("v2.0.0", now.Add(-time.Hour)))
+		case "/example.com/m/@v/list":
+			_, _ = io.WriteString(w, "v1.0.0\nv1.1.0\n")
+		case "/example.com/m/@v/v1.0.0.info":
+			_, _ = io.WriteString(w, info("v1.0.0", now.Add(-30*24*time.Hour)))
+		case "/example.com/m/@v/v1.1.0.info":
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer up.Close()
+	s := newTestServer(t, up.URL, availability.CommitTimeSource{})
+
+	r := httptest.NewRecorder()
+	s.ServeHTTP(r, httptest.NewRequest(http.MethodGet, "/example.com/m/@latest", nil))
+	if r.Code != http.StatusOK || !bytes.Contains(r.Body.Bytes(), []byte(`"Version":"v1.0.0"`)) {
+		t.Fatalf("status=%d body=%q", r.Code, r.Body.String())
+	}
+}
+
+func TestLatestFallsBackWhenTaggedInfoIsUnavailable(t *testing.T) {
+	var unavailableCalls atomic.Int32
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/example.com/m/@latest":
+			_, _ = io.WriteString(w, info("v1.1.0", now.Add(-30*24*time.Hour)))
+		case "/example.com/m/@v/list":
+			_, _ = io.WriteString(w, "v1.0.0\nv1.1.0\n")
+		case "/example.com/m/@v/v1.0.0.info":
+			_, _ = io.WriteString(w, info("v1.0.0", now.Add(-30*24*time.Hour)))
+		case "/example.com/m/@v/v1.1.0.info":
+			unavailableCalls.Add(1)
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer up.Close()
+	s := newTestServer(t, up.URL, availability.CommitTimeSource{})
+
+	r := httptest.NewRecorder()
+	s.ServeHTTP(r, httptest.NewRequest(http.MethodGet, "/example.com/m/@latest", nil))
+	if r.Code != http.StatusOK || !bytes.Contains(r.Body.Bytes(), []byte(`"Version":"v1.0.0"`)) || unavailableCalls.Load() != 1 {
+		t.Fatalf("status=%d body=%q unavailable calls=%d", r.Code, r.Body.String(), unavailableCalls.Load())
+	}
+}
+
+func TestLatestReconcilesIncompatibleVersionWithModuleAwareness(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		goMod string
+		want  int
+	}{
+		{name: "module aware", goMod: "module example.com/m\n\ngo 1.20\n", want: http.StatusNotFound},
+		{name: "legacy", goMod: "module example.com/m\n", want: http.StatusOK},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/example.com/m/@latest":
+					_, _ = io.WriteString(w, info("v2.0.0-preview.1+incompatible", now.Add(-30*24*time.Hour)))
+				case "/example.com/m/@v/list":
+					_, _ = io.WriteString(w, "v1.0.0\nv2.0.0-preview.1+incompatible\n")
+				case "/example.com/m/@v/v1.0.0.info":
+					_, _ = io.WriteString(w, info("v1.0.0", now.Add(-time.Hour)))
+				case "/example.com/m/@v/v2.0.0-preview.1+incompatible.info":
+					_, _ = io.WriteString(w, info("v2.0.0-preview.1+incompatible", now.Add(-30*24*time.Hour)))
+				case "/example.com/m/@v/v1.0.0.mod":
+					_, _ = io.WriteString(w, tt.goMod)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer up.Close()
+			s := newTestServer(t, up.URL, availability.CommitTimeSource{})
+
+			r := httptest.NewRecorder()
+			s.ServeHTTP(r, httptest.NewRequest(http.MethodGet, "/example.com/m/@latest", nil))
+			if r.Code != tt.want {
+				t.Fatalf("status=%d body=%q, want %d", r.Code, r.Body.String(), tt.want)
+			}
+			if tt.want == http.StatusOK && !bytes.Contains(r.Body.Bytes(), []byte(`"Version":"v2.0.0-preview.1+incompatible"`)) {
+				t.Fatalf("unexpected latest body=%q", r.Body.String())
 			}
 		})
 	}

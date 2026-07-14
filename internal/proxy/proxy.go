@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/Goryudyuma/gomod-cooldown/internal/availability"
+	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/module"
 	"golang.org/x/mod/semver"
 )
@@ -41,9 +42,11 @@ type Server struct {
 	logger   *log.Logger
 	verbose  bool
 
-	cacheMu  sync.Mutex
-	infos    map[string]cachedInfo
-	inflight map[string]*infoCall
+	cacheMu           sync.Mutex
+	infos             map[string]cachedInfo
+	inflight          map[string]*infoCall
+	moduleAwareness   map[string]cachedModuleAwareness
+	awarenessInflight map[string]*moduleAwarenessCall
 }
 
 type cachedInfo struct {
@@ -55,6 +58,33 @@ type infoCall struct {
 	done         chan struct{}
 	result       cachedInfo
 	retryWaiters bool
+}
+
+type cachedModuleAwareness struct {
+	aware bool
+	err   error
+}
+
+type moduleAwarenessCall struct {
+	done         chan struct{}
+	result       cachedModuleAwareness
+	retryWaiters bool
+}
+
+type infoStatusError struct {
+	path    string
+	version string
+	status  int
+}
+
+func (e *infoStatusError) Error() string {
+	return fmt.Sprintf("upstream .info for %s@%s returned %d", e.path, e.version, e.status)
+}
+
+func unavailableInfo(err error) bool {
+	var statusErr *infoStatusError
+	return errors.As(err, &statusErr) &&
+		(statusErr.status == http.StatusNotFound || statusErr.status == http.StatusGone)
 }
 
 // VersionInfo is validated metadata returned by a GOPROXY .info endpoint.
@@ -91,15 +121,17 @@ func New(cfg Config) (*Server, error) {
 		cfg.Logger = log.New(io.Discard, "", 0)
 	}
 	return &Server{
-		upstream: u,
-		client:   &client,
-		source:   cfg.Source,
-		cooldown: cfg.Cooldown,
-		now:      cfg.Now,
-		logger:   cfg.Logger,
-		verbose:  cfg.Verbose,
-		infos:    make(map[string]cachedInfo),
-		inflight: make(map[string]*infoCall),
+		upstream:          u,
+		client:            &client,
+		source:            cfg.Source,
+		cooldown:          cfg.Cooldown,
+		now:               cfg.Now,
+		logger:            cfg.Logger,
+		verbose:           cfg.Verbose,
+		infos:             make(map[string]cachedInfo),
+		inflight:          make(map[string]*infoCall),
+		moduleAwareness:   make(map[string]cachedModuleAwareness),
+		awarenessInflight: make(map[string]*moduleAwarenessCall),
 	}, nil
 }
 
@@ -184,15 +216,36 @@ func (s *Server) handleLatest(w http.ResponseWriter, r *http.Request, path strin
 		s.badGateway(w, fmt.Errorf("invalid upstream latest for %s: %w", path, err))
 		return
 	}
+	if !module.IsPseudoVersion(latest.Version) {
+		tagInfo, err := s.info(r.Context(), path, latest.Version)
+		if err != nil {
+			if unavailableInfo(err) {
+				s.handleLatestFallback(w, r, path)
+				return
+			}
+			s.badGateway(w, err)
+			return
+		}
+		if !tagInfo.Time.Equal(latest.Time) {
+			s.badGateway(w, fmt.Errorf("inconsistent upstream latest for %s@%s", path, latest.Version))
+			return
+		}
+		latest = tagInfo
+	}
 	ok, err := s.allowed(r.Context(), path, latest)
 	if err != nil {
 		s.badGateway(w, err)
 		return
 	}
-	if ok {
+	incompatibleTag := strings.HasSuffix(latest.Version, "+incompatible") && !module.IsPseudoVersion(latest.Version)
+	if ok && !incompatibleTag {
 		s.writeUpstream(w, status, contentType, body)
 		return
 	}
+	// A compatible version hidden by the cooldown can otherwise make an older,
+	// semantically higher +incompatible tag appear to be the latest version.
+	// Pseudo-versions are absent from @v/list and must continue through @latest.
+	// Reconcile such tags with the filtered list and the module-awareness check.
 	s.handleLatestFallback(w, r, path)
 }
 
@@ -242,7 +295,7 @@ func (s *Server) handleLatestFallback(w http.ResponseWriter, r *http.Request, pa
 }
 
 func (s *Server) filter(ctx context.Context, path string, versions []string) ([]string, error) {
-	kept := make([]string, 0, len(versions))
+	candidates := make([]string, 0, len(versions))
 	for _, version := range versions {
 		if module.IsPseudoVersion(version) {
 			continue
@@ -250,19 +303,65 @@ func (s *Server) filter(ctx context.Context, path string, versions []string) ([]
 		if !canonical(version) {
 			return nil, fmt.Errorf("invalid version %q in upstream list for %s", version, path)
 		}
+		candidates = append(candidates, version)
+	}
+
+	kept := make([]string, 0, len(candidates))
+	latestCompatible := ""
+	latestCompatibleInCooldown := false
+	for _, version := range candidates {
 		info, err := s.info(ctx, path, version)
 		if err != nil {
+			if unavailableInfo(err) {
+				continue
+			}
 			return nil, err
 		}
 		ok, err := s.allowed(ctx, path, info)
 		if err != nil {
 			return nil, err
 		}
+		if !strings.HasSuffix(version, "+incompatible") &&
+			(latestCompatible == "" || semver.Compare(version, latestCompatible) > 0) {
+			latestCompatible = version
+			latestCompatibleInCooldown = !ok
+		}
 		if ok {
 			kept = append(kept, version)
 		}
 	}
+
+	if latestCompatibleInCooldown && containsHigherIncompatible(kept, latestCompatible) {
+		aware, err := s.moduleAware(ctx, path, latestCompatible)
+		if err != nil {
+			return nil, err
+		}
+		if aware {
+			filtered := kept[:0]
+			for _, version := range kept {
+				if higherIncompatible(version, latestCompatible) {
+					s.logger.Printf("excluded module=%s version=%s reason=module-aware-compatible-version compatible_version=%s", path, version, latestCompatible)
+					continue
+				}
+				filtered = append(filtered, version)
+			}
+			kept = filtered
+		}
+	}
 	return kept, nil
+}
+
+func containsHigherIncompatible(versions []string, compatible string) bool {
+	for _, version := range versions {
+		if higherIncompatible(version, compatible) {
+			return true
+		}
+	}
+	return false
+}
+
+func higherIncompatible(version, compatible string) bool {
+	return strings.HasSuffix(version, "+incompatible") && semver.Compare(version, compatible) > 0
 }
 
 func (s *Server) allowed(ctx context.Context, path string, info VersionInfo) (bool, error) {
@@ -311,7 +410,7 @@ func (s *Server) info(ctx context.Context, path, version string) (VersionInfo, e
 
 		c = s.fetchInfo(ctx, path, version)
 		s.cacheMu.Lock()
-		if c.err == nil {
+		if c.err == nil || unavailableInfo(c.err) {
 			s.infos[key] = c
 		}
 		call.result = c
@@ -330,7 +429,7 @@ func (s *Server) fetchInfo(ctx context.Context, path, version string) cachedInfo
 	}
 	body, status, _, err := s.fetch(ctx, p)
 	if err == nil && status != http.StatusOK {
-		err = fmt.Errorf("upstream .info for %s@%s returned %d", path, version, status)
+		err = &infoStatusError{path: path, version: version, status: status}
 	}
 	var info VersionInfo
 	if err == nil {
@@ -340,6 +439,61 @@ func (s *Server) fetchInfo(ctx context.Context, path, version string) cachedInfo
 		err = fmt.Errorf("get .info for %s@%s: %w", path, version, err)
 	}
 	return cachedInfo{info: info, err: err}
+}
+
+func (s *Server) moduleAware(ctx context.Context, path, version string) (bool, error) {
+	key := path + "\x00" + version
+	for {
+		s.cacheMu.Lock()
+		cached, ok := s.moduleAwareness[key]
+		if ok {
+			s.cacheMu.Unlock()
+			return cached.aware, cached.err
+		}
+		if call, exists := s.awarenessInflight[key]; exists {
+			s.cacheMu.Unlock()
+			select {
+			case <-call.done:
+				if call.retryWaiters && ctx.Err() == nil {
+					continue
+				}
+				return call.result.aware, call.result.err
+			case <-ctx.Done():
+				return false, fmt.Errorf("wait for .mod for %s@%s: %w", path, version, ctx.Err())
+			}
+		}
+		call := &moduleAwarenessCall{done: make(chan struct{})}
+		s.awarenessInflight[key] = call
+		s.cacheMu.Unlock()
+
+		cached = s.fetchModuleAwareness(ctx, path, version)
+		s.cacheMu.Lock()
+		if cached.err == nil {
+			s.moduleAwareness[key] = cached
+		}
+		call.result = cached
+		call.retryWaiters = ctx.Err() != nil && errors.Is(cached.err, ctx.Err())
+		delete(s.awarenessInflight, key)
+		close(call.done)
+		s.cacheMu.Unlock()
+		return cached.aware, cached.err
+	}
+}
+
+func (s *Server) fetchModuleAwareness(ctx context.Context, path, version string) cachedModuleAwareness {
+	p, err := versionEndpoint(path, version, ".mod")
+	if err != nil {
+		return cachedModuleAwareness{err: err}
+	}
+	body, status, _, err := s.fetch(ctx, p)
+	if err == nil && status != http.StatusOK {
+		err = fmt.Errorf("upstream .mod for %s@%s returned %d", path, version, status)
+	}
+	if err != nil {
+		return cachedModuleAwareness{err: fmt.Errorf("get .mod for %s@%s: %w", path, version, err)}
+	}
+	legacy := fmt.Appendf(nil, "module %s\n", modfile.AutoQuote(path))
+	return cachedModuleAwareness{aware: !bytes.Equal(body, legacy)}
 }
 
 func endpoint(path, suffix string) (string, error) {

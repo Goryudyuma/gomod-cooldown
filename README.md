@@ -56,13 +56,32 @@ other GOPROXY endpoints are passed through to the configured upstream. Therefore
 an explicit request such as `go get example.com/mod@v1.2.3` and a version already
 recorded in `go.mod` can be downloaded even during its cooldown.
 
+If an upstream `@v/list` names a version whose `.info` endpoint returns 404 or
+410, the wrapper treats only that unavailable version as unusable and omits it
+from discovery. That negative result is cached for the rest of the CLI
+invocation. Other `.info` failures, including 403, 429, 5xx, transport errors,
+and malformed or inconsistent metadata, continue to fail discovery with 502.
+
+Implicit discovery also avoids selecting a higher `+incompatible` version only
+because the cooldown removed the highest usable compatible version named by the
+raw list. If the removed compatible version has a real, module-aware `.mod`
+file, higher `+incompatible` candidates are omitted. A synthetic legacy `.mod`
+containing only `module <path>` is not treated as evidence of module awareness, so those
+candidates remain visible. An exact or already-pinned `+incompatible` version
+remains downloadable through the version-specific pass-through endpoints.
+
+GOPROXY discovery requests do not tell the proxy the original version query or
+the currently selected version. Consequently, this safeguard can also make a
+version-prefix query such as `@v2` invisible to implicit discovery; request an
+exact version when that distinction matters.
+
 The wrapper intentionally does not append `https://proxy.golang.org,direct` (or
 any fallback) to the child's `GOPROXY`: a discovery 404 must not bypass the
 cooldown via a later proxy.
 
-Validated `.info` metadata used for version decisions is cached in memory and
-reused only for the lifetime of one CLI invocation. The cache is discarded at
-exit and is not carried into the next invocation. The mutable `@v/list` and
+Validated `.info` metadata used for version decisions is also cached in memory
+and reused only for the lifetime of one CLI invocation. All caches are discarded
+at exit and are not carried into the next invocation. The mutable `@v/list` and
 `@latest` responses themselves are fetched from the upstream for every request.
 
 ## Availability time

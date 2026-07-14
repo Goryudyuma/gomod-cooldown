@@ -27,6 +27,12 @@ const integrationModulePath = "example.com/gomod-cooldown-test/dep"
 type testProxyVersion struct {
 	version string
 	stamp   time.Time
+	files   []testProxyFile
+}
+
+type testProxyFile struct {
+	name     string
+	contents string
 }
 
 type testProxyModule struct {
@@ -111,25 +117,165 @@ func TestGoCommandReportsOnlyEligibleVersions(t *testing.T) {
 	p.assertNoUnknown(t)
 }
 
-func TestGoCommandPseudoLatest(t *testing.T) {
+func TestGoCommandSkipsUnavailableListedVersion(t *testing.T) {
+	p := newRecordingModuleProxy(t, []testProxyModule{standardIntegrationModule()})
+	p.setResponse(t, versionEndpoint(integrationModulePath, "v1.0.1-GA", ".info"), testProxyResponse{
+		status: http.StatusNotFound, contentType: "text/plain", body: []byte("not found\n"),
+	})
+	dir := writeIntegrationModule(t, "v1.0.0")
+	code, _, stderr := runGoThroughCooldown(t, p.server.URL, dir, "get", "-u", "all")
+	if code != 0 {
+		t.Fatalf("exit=%d stderr=%s", code, stderr)
+	}
+	if got := requiredVersion(t, dir, integrationModulePath); got != "v1.1.0" {
+		t.Fatalf("required version=%q, want v1.1.0", got)
+	}
+	escapedUnavailable := versionEndpoint(integrationModulePath, "v1.0.1-GA", ".info")
+	if got := countMatching(p.allRequests(), func(path string) bool { return path == escapedUnavailable }); got != 1 {
+		t.Fatalf("unavailable .info requests=%d, want 1; all requests: %v", got, p.allRequests())
+	}
+	p.assertNoUnknown(t)
+}
+
+func TestGoCommandDoesNotUpgradeAWSSDKToOldIncompatiblePrerelease(t *testing.T) {
+	const awsPath = "github.com/aws/aws-sdk-go-v2"
+	const currentVersion = "v1.42.1"
+	const incompatible = "v2.0.0-preview.4+incompatible"
+	current := time.Now().UTC().Truncate(time.Second)
+	p := newRecordingModuleProxy(t, []testProxyModule{{
+		path: awsPath,
+		versions: []testProxyVersion{
+			{
+				version: "v1.41.12", stamp: current.Add(-60 * 24 * time.Hour),
+				files: []testProxyFile{{name: "aws/middleware/middleware.go", contents: "package middleware\n"}},
+			},
+			{
+				version: currentVersion, stamp: current.Add(-time.Hour),
+				files: []testProxyFile{{name: "aws/middleware/middleware.go", contents: "package middleware\n"}},
+			},
+			{version: incompatible, stamp: current.Add(-60 * 24 * time.Hour)},
+		},
+		listed: []string{"v1.41.12", currentVersion, incompatible},
+		latest: currentVersion,
+	}})
+	notFound := testProxyResponse{status: http.StatusNotFound, contentType: "text/plain", body: []byte("not found\n")}
+	for _, path := range []string{awsPath + "/aws", awsPath + "/aws/middleware"} {
+		p.setResponseIfAbsent(moduleEndpoint(path, "/@v/list"), notFound)
+		p.setResponseIfAbsent(moduleEndpoint(path, "/@latest"), notFound)
+	}
+	dir := writeIntegrationModuleFor(t, awsPath, currentVersion, awsPath+"/aws/middleware")
+	code, _, stderr := runGoThroughCooldown(t, p.server.URL, dir, "get", "-u", "all")
+	if code != 0 {
+		t.Fatalf("exit=%d stderr=%s", code, stderr)
+	}
+	if got := requiredVersion(t, dir, awsPath); got != currentVersion {
+		t.Fatalf("required version=%q, want current %s", got, currentVersion)
+	}
+	if p.countContains(incompatible+".zip") != 0 {
+		t.Fatalf("downloaded incompatible prerelease: %v", p.allRequests())
+	}
+	if p.countContains(currentVersion+".mod") == 0 {
+		t.Fatalf("module-awareness heuristic was not exercised: %v", p.allRequests())
+	}
+	p.assertNoUnknown(t)
+}
+
+func TestGoCommandKeepsLegacyIncompatibleUpgrade(t *testing.T) {
+	current := time.Now().UTC().Truncate(time.Second)
+	incompatible := "v2.0.0-preview.1+incompatible"
+	p := newRecordingModuleProxy(t, []testProxyModule{{
+		path: integrationModulePath,
+		versions: []testProxyVersion{
+			{version: "v1.0.0", stamp: current.Add(-60 * 24 * time.Hour)},
+			{version: "v1.1.0", stamp: current.Add(-time.Hour)},
+			{version: incompatible, stamp: current.Add(-60 * 24 * time.Hour)},
+		},
+		listed: []string{"v1.0.0", "v1.1.0", incompatible},
+		latest: "v1.1.0",
+	}})
+	legacyMod := testProxyResponse{
+		status: http.StatusOK, contentType: "text/plain", body: []byte("module " + integrationModulePath + "\n"),
+	}
+	p.setResponse(t, versionEndpoint(integrationModulePath, "v1.1.0", ".mod"), legacyMod)
+	p.setResponse(t, versionEndpoint(integrationModulePath, incompatible, ".mod"), legacyMod)
+	dir := writeIntegrationModule(t, "v1.1.0")
+	code, _, stderr := runGoThroughCooldown(t, p.server.URL, dir, "get", "-u", "all")
+	if code != 0 {
+		t.Fatalf("exit=%d stderr=%s", code, stderr)
+	}
+	if got := requiredVersion(t, dir, integrationModulePath); got != incompatible {
+		t.Fatalf("required version=%q, want legacy update %s", got, incompatible)
+	}
+	if p.countContains(incompatible+".zip") == 0 {
+		t.Fatalf("legacy incompatible version was not downloaded: %v", p.allRequests())
+	}
+	p.assertNoUnknown(t)
+}
+
+func TestGoCommandExactAndPinnedIncompatibleVersionBypassDiscovery(t *testing.T) {
+	stamp := time.Now().UTC().Truncate(time.Second).Add(-60 * 24 * time.Hour)
+	version := "v2.0.0-preview.1+incompatible"
 	for _, tt := range []struct {
-		name    string
-		age     time.Duration
-		allowed bool
+		name   string
+		pinned bool
 	}{
-		{name: "eligible", age: 30 * 24 * time.Hour, allowed: true},
-		{name: "still in cooldown", age: time.Hour, allowed: false},
+		{name: "exact"},
+		{name: "pinned", pinned: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			testGoCommandPseudoLatest(t, tt.age, tt.allowed)
+			p := newRecordingModuleProxy(t, []testProxyModule{{
+				path: integrationModulePath,
+				versions: []testProxyVersion{
+					{version: version, stamp: stamp},
+				},
+				listed: []string{version},
+				latest: version,
+			}})
+			dir := writeBareIntegrationModule(t)
+			args := []string{"mod", "download", integrationModulePath + "@" + version}
+			if tt.pinned {
+				dir = writeIntegrationModule(t, version)
+				args = []string{"mod", "download", "all"}
+			}
+			code, _, stderr := runGoThroughCooldown(t, p.server.URL, dir, args...)
+			if code != 0 {
+				t.Fatalf("exit=%d stderr=%s", code, stderr)
+			}
+			if p.countSuffix("/@v/list") != 0 || p.countSuffix("/@latest") != 0 {
+				t.Fatalf("incompatible version used discovery: %v", p.allRequests())
+			}
+			if p.countContains(version+".zip") == 0 {
+				t.Fatalf("incompatible version was not downloaded: %v", p.allRequests())
+			}
+			p.assertNoUnknown(t)
 		})
 	}
 }
 
-func testGoCommandPseudoLatest(t *testing.T, age time.Duration, allowed bool) {
+func TestGoCommandPseudoLatest(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		major   string
+		age     time.Duration
+		allowed bool
+	}{
+		{name: "eligible", major: "v0", age: 30 * 24 * time.Hour, allowed: true},
+		{name: "eligible incompatible", major: "v2", age: 30 * 24 * time.Hour, allowed: true},
+		{name: "still in cooldown", major: "v0", age: time.Hour, allowed: false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			testGoCommandPseudoLatest(t, tt.major, tt.age, tt.allowed)
+		})
+	}
+}
+
+func testGoCommandPseudoLatest(t *testing.T, major string, age time.Duration, allowed bool) {
 	t.Helper()
 	stamp := time.Now().UTC().Truncate(time.Second).Add(-age)
-	version := module.PseudoVersion("v0", "", stamp, "abcdefabcdef")
+	version := module.PseudoVersion(major, "", stamp, "abcdefabcdef")
+	if major == "v2" {
+		version += "+incompatible"
+	}
 	path := "example.com/gomod-cooldown-test/pseudo"
 	p := newRecordingModuleProxy(t, []testProxyModule{{
 		path: path, versions: []testProxyVersion{{version: version, stamp: stamp}}, latest: version,
@@ -154,7 +300,6 @@ func TestGoCommandFailsClosedWithoutChangingGoMod(t *testing.T) {
 		response testProxyResponse
 	}{
 		{name: "upstream error", response: testProxyResponse{status: http.StatusInternalServerError, body: []byte("failed\n")}},
-		{name: "missing metadata", response: testProxyResponse{status: http.StatusNotFound, body: []byte("not found\n")}},
 		{name: "malformed metadata", response: testProxyResponse{status: http.StatusOK, contentType: "application/json", body: []byte("not-json")}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -257,7 +402,7 @@ func (p *recordingModuleProxy) addVersion(t *testing.T, path string, version tes
 		status: http.StatusOK, contentType: "text/plain", body: []byte("module " + path + "\n\ngo 1.20\n"),
 	}
 	p.responses[versionEndpoint(path, version.version, ".zip")] = testProxyResponse{
-		status: http.StatusOK, contentType: "application/zip", body: moduleZip(t, path, version.version),
+		status: http.StatusOK, contentType: "application/zip", body: moduleZip(t, path, version.version, version.files),
 	}
 }
 
@@ -273,13 +418,16 @@ func infoResponse(t *testing.T, version testProxyVersion) testProxyResponse {
 	return testProxyResponse{status: http.StatusOK, contentType: "application/json", body: body}
 }
 
-func moduleZip(t *testing.T, path, version string) []byte {
+func moduleZip(t *testing.T, path, version string, files []testProxyFile) []byte {
 	t.Helper()
 	var buf bytes.Buffer
 	zw := zip.NewWriter(&buf)
 	prefix := path + "@" + version + "/"
 	writeZipEntry(t, zw, prefix+"go.mod", "module "+path+"\n\ngo 1.20\n")
 	writeZipEntry(t, zw, prefix+"dep.go", "package dep\n")
+	for _, file := range files {
+		writeZipEntry(t, zw, prefix+file.name, file.contents)
+	}
 	if err := zw.Close(); err != nil {
 		t.Fatalf("close module zip: %v", err)
 	}
@@ -378,10 +526,15 @@ func versionEndpoint(path, version, suffix string) string {
 
 func writeIntegrationModule(t *testing.T, version string) string {
 	t.Helper()
+	return writeIntegrationModuleFor(t, integrationModulePath, version, integrationModulePath)
+}
+
+func writeIntegrationModuleFor(t *testing.T, modulePath, version, importPath string) string {
+	t.Helper()
 	dir := t.TempDir()
-	contents := fmt.Sprintf("module example.com/gomod-cooldown-test/root\n\ngo 1.25.0\n\nrequire %s %s\n", integrationModulePath, version)
+	contents := fmt.Sprintf("module example.com/gomod-cooldown-test/root\n\ngo 1.25.0\n\nrequire %s %s\n", modulePath, version)
 	writeFile(t, filepath.Join(dir, "go.mod"), []byte(contents))
-	writeFile(t, filepath.Join(dir, "root.go"), []byte("package root\n\nimport _ \""+integrationModulePath+"\"\n"))
+	writeFile(t, filepath.Join(dir, "root.go"), []byte("package root\n\nimport _ \""+importPath+"\"\n"))
 	return dir
 }
 

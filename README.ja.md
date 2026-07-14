@@ -55,11 +55,29 @@ gomod-cooldown --cooldown=14d -- go get -u all
 すべて指定upstreamへ透過します。そのため、`go get example.com/mod@v1.2.3` のような
 明示指定や、`go.mod` にすでに記録されたversionはcooldown中でもダウンロードできます。
 
+upstreamの `@v/list` に含まれるversionの `.info` endpointが404または410を返す場合、
+その取得不能なversionだけを使用不能としてdiscoveryから除外します。このnegative resultは
+同じCLI実行が終わるまでcacheします。403、429、5xx、通信エラー、不正または整合しない
+metadataなど、その他の `.info` 失敗は引き続きdiscovery全体を502でfail closedにします。
+
+また、cooldownによってraw listにある取得可能な最高compatible versionが除外された
+ことだけを理由に、それより高い `+incompatible` versionが暗黙のdiscoveryで選ばれない
+ようにします。除外された
+compatible versionの `.mod` が実際のmodule-awareなファイルなら、それより高い
+`+incompatible` 候補も除外します。`module <path>` だけで構成されたsyntheticなlegacy
+`.mod` はmodule-awareの根拠とみなさないため、その場合は候補を残します。exact指定または
+pin済みの `+incompatible` versionは、version-specific endpointの透過によって引き続き
+ダウンロードできます。
+
+GOPROXYのdiscovery requestからは、元のversion queryや現在選択中のversionを判別できません。
+そのため、この保護によって `@v2` のようなversion-prefix queryも暗黙のdiscoveryから
+見えなくなる場合があります。この区別が必要な場合はexact versionを指定してください。
+
 子プロセスの `GOPROXY` に `https://proxy.golang.org,direct` などのfallbackは追加しません。
 discovery endpointが返す404が後段proxyで迂回されないようにするためです。
 
-version判定用に検証済みの `.info` metadataは、1回のCLI実行中だけmemoryにcacheして
-再利用します。cacheは終了時に破棄され、次回起動には引き継ぎません。変化し得る
+version判定用に検証済みの `.info` metadataも、1回のCLI実行中だけmemoryにcacheして
+再利用します。すべてのcacheは終了時に破棄され、次回起動には引き継ぎません。変化し得る
 `@v/list` と `@latest` 自体はcacheせず、requestごとにupstreamから取得します。
 
 ## availability time

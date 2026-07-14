@@ -93,6 +93,22 @@ func TestDiscoveryDecodesUppercaseModulePathFromRealGoClient(t *testing.T) {
 	}
 }
 
+func TestListEscapesUppercaseVersionForUpstream(t *testing.T) {
+	up := fakeProxy(t, map[string]string{
+		"/google.golang.org/grpc/@v/list":             "v1.0.0\nv1.0.1-GA\n",
+		"/google.golang.org/grpc/@v/v1.0.0.info":      info("v1.0.0", now.Add(-30*24*time.Hour)),
+		"/google.golang.org/grpc/@v/v1.0.1-!g!a.info": info("v1.0.1-GA", now.Add(-30*24*time.Hour)),
+	})
+	defer up.Close()
+	s := newTestServer(t, up.URL, availability.CommitTimeSource{})
+
+	r := httptest.NewRecorder()
+	s.ServeHTTP(r, httptest.NewRequest(http.MethodGet, "/google.golang.org/grpc/@v/list", nil))
+	if r.Code != http.StatusOK || r.Body.String() != "v1.0.0\nv1.0.1-GA\n" {
+		t.Fatalf("status=%d body=%q", r.Code, r.Body.String())
+	}
+}
+
 func TestPassthroughNeverChecksAvailability(t *testing.T) {
 	var source callsSource
 	up := fakeProxy(t, map[string]string{"/example.com/m/@v/v1.9.0.info": info("v1.9.0", now), "/example.com/m/@v/v1.9.0.mod": "module example.com/m\n", "/example.com/m/@v/v1.9.0.zip": "zip"})

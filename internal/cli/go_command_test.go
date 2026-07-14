@@ -104,7 +104,7 @@ func TestGoCommandReportsOnlyEligibleVersions(t *testing.T) {
 		t.Fatalf("exit=%d stderr=%s", code, stderr)
 	}
 	fields := strings.Fields(stdout)
-	want := []string{integrationModulePath, "v1.0.0", "v1.1.0"}
+	want := []string{integrationModulePath, "v1.0.0", "v1.0.1-GA", "v1.1.0"}
 	if !slices.Equal(fields, want) {
 		t.Fatalf("versions=%q, want %q", fields, want)
 	}
@@ -154,6 +154,7 @@ func TestGoCommandFailsClosedWithoutChangingGoMod(t *testing.T) {
 		response testProxyResponse
 	}{
 		{name: "upstream error", response: testProxyResponse{status: http.StatusInternalServerError, body: []byte("failed\n")}},
+		{name: "missing metadata", response: testProxyResponse{status: http.StatusNotFound, body: []byte("not found\n")}},
 		{name: "malformed metadata", response: testProxyResponse{status: http.StatusOK, contentType: "application/json", body: []byte("not-json")}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -184,10 +185,11 @@ func standardIntegrationModule() testProxyModule {
 		path: integrationModulePath,
 		versions: []testProxyVersion{
 			{version: "v1.0.0", stamp: now.Add(-60 * 24 * time.Hour)},
+			{version: "v1.0.1-GA", stamp: now.Add(-45 * 24 * time.Hour)},
 			{version: "v1.1.0", stamp: now.Add(-30 * 24 * time.Hour)},
 			{version: "v1.2.0", stamp: now.Add(-time.Hour)},
 		},
-		listed: []string{"v1.0.0", "v1.1.0", "v1.2.0"},
+		listed: []string{"v1.0.0", "v1.0.1-GA", "v1.1.0", "v1.2.0"},
 		latest: "v1.2.0",
 	}
 }

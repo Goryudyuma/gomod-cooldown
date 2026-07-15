@@ -215,8 +215,16 @@ func TestExecutablePreservesChildContractAndCleansUp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Join(got.Args, "|") != "one|two words" || got.CWD != resolvedCWD || got.Env != "from-executable" || got.Stdin != "black-box stdin" {
-		t.Fatalf("child contract=%+v, cwd want %q", got, cwd)
+	resolvedChildCWD, err := filepath.EvalSymlinks(got.CWD)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cwdMatches := resolvedChildCWD == resolvedCWD
+	if runtime.GOOS == "windows" {
+		cwdMatches = strings.EqualFold(resolvedChildCWD, resolvedCWD)
+	}
+	if strings.Join(got.Args, "|") != "one|two words" || !cwdMatches || got.Env != "from-executable" || got.Stdin != "black-box stdin" {
+		t.Fatalf("child contract=%+v, resolved cwd want %q", got, resolvedCWD)
 	}
 	if !strings.HasPrefix(got.GOPROXY, "http://127.0.0.1:") || stderr.String() != "child stderr\n" {
 		t.Fatalf("GOPROXY=%q stderr=%q", got.GOPROXY, stderr.String())

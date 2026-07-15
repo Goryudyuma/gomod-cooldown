@@ -1,0 +1,318 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag (for example, v1.0.0-rc.1)
+        required: true
+        type: string
+      target_sha:
+        description: Exact 40-character release commit (current main for a new tag)
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: source-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: release
+    permissions:
+      actions: read
+      contents: write
+    env:
+      EXPECTED_MODULE: github.com/Goryudyuma/gomod-cooldown
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.tag }}
+      TARGET_SHA: ${{ inputs.target_sha }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: stable
+
+      - name: Validate the requested release target
+        id: release_state
+        run: |
+          expected_workflow_ref="${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/heads/main"
+          if [[ "${GITHUB_WORKFLOW_REF}" != "${expected_workflow_ref}" ]]; then
+            echo "Run this workflow from main, not ${GITHUB_WORKFLOW_REF}." >&2
+            exit 1
+          fi
+
+          if [[ ! "${TARGET_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "target_sha must be a full lowercase 40-character commit SHA." >&2
+            exit 1
+          fi
+
+          if [[ ! "${RELEASE_TAG}" =~ ^v1\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
+            echo "tag must be a canonical v1 semantic version." >&2
+            exit 1
+          fi
+          if [[ "${RELEASE_TAG}" == *-* ]]; then
+            prerelease="${RELEASE_TAG#*-}"
+            IFS=. read -ra identifiers <<<"${prerelease}"
+            for identifier in "${identifiers[@]}"; do
+              if [[ "${identifier}" =~ ^[0-9]+$ && "${identifier}" != "0" && "${identifier}" == 0* ]]; then
+                echo "Numeric prerelease identifiers must not contain leading zeroes." >&2
+                exit 1
+              fi
+            done
+          fi
+
+          release_id="$(
+            gh api graphql \
+              -f owner="${GITHUB_REPOSITORY_OWNER}" \
+              -f name="${GITHUB_REPOSITORY#*/}" \
+              -f tag="${RELEASE_TAG}" \
+              -f query='query($owner: String!, $name: String!, $tag: String!) {
+                repository(owner: $owner, name: $name) {
+                  release(tagName: $tag) { id }
+                }
+              }' \
+              --jq '.data.repository.release.id // ""'
+          )"
+          if [[ -n "${release_id}" ]]; then
+            echo "GitHub Release ${RELEASE_TAG} already exists; refusing to republish it." >&2
+            exit 1
+          fi
+
+          remote_tag="$(git ls-remote --tags origin "refs/tags/${RELEASE_TAG}")"
+          if [[ -n "${remote_tag}" ]]; then
+            resume_ref="refs/gomod-cooldown-release-resume/${GITHUB_RUN_ID}"
+            git fetch --force --no-tags origin \
+              "refs/tags/${RELEASE_TAG}:${resume_ref}"
+            if [[ "$(git cat-file -t "${resume_ref}")" != "tag" ]]; then
+              echo "Existing tag ${RELEASE_TAG} is not an annotated tag." >&2
+              exit 1
+            fi
+            peeled_sha="$(git rev-parse "${resume_ref}^{commit}")"
+            if [[ "${peeled_sha}" != "${TARGET_SHA}" ]]; then
+              echo "Existing tag ${RELEASE_TAG} resolves to ${peeled_sha}, not ${TARGET_SHA}." >&2
+              exit 1
+            fi
+            tag_exists=true
+            echo "Resuming release ${RELEASE_TAG} for ${TARGET_SHA}."
+          else
+            git fetch --force --no-tags origin \
+              +refs/heads/main:refs/remotes/origin/main
+            main_sha="$(git rev-parse refs/remotes/origin/main)"
+            if [[ "${TARGET_SHA}" != "${main_sha}" ]]; then
+              echo "target_sha is ${TARGET_SHA}, but current main is ${main_sha}." >&2
+              exit 1
+            fi
+            tag_exists=false
+          fi
+
+          git checkout --detach "${TARGET_SHA}"
+          if [[ "$(go list -m)" != "${EXPECTED_MODULE}" ]]; then
+            echo "Unexpected module path: $(go list -m)" >&2
+            exit 1
+          fi
+          echo "tag_exists=${tag_exists}" >>"${GITHUB_OUTPUT}"
+
+      - name: Require successful CI for the exact commit
+        run: |
+          successful_runs="$(
+            gh api --method GET \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs" \
+              -f branch=main \
+              -f event=push \
+              -f status=success \
+              -f head_sha="${TARGET_SHA}" \
+              -f per_page=1 \
+              --jq '.total_count'
+          )"
+          if [[ "${successful_runs}" -lt 1 ]]; then
+            echo "No successful CI push run exists for ${TARGET_SHA}." >&2
+            exit 1
+          fi
+
+      - name: Re-run release preflight checks
+        run: |
+          go test ./...
+          go vet ./...
+
+          binary="${RUNNER_TEMP}/gomod-cooldown-preflight"
+          go build -trimpath -o "${binary}" ./cmd/gomod-cooldown
+          "${binary}" --help
+          "${binary}" --version
+          "${binary}" -- go version
+          go version -m "${binary}"
+
+      - name: Verify licenses in the exact-commit module zip
+        env:
+          GOCACHE: ${{ runner.temp }}/preflight-build-cache
+          GOMODCACHE: ${{ runner.temp }}/preflight-module-cache
+          GOPROXY: https://proxy.golang.org,direct
+        run: |
+          for required_file in LICENSE THIRD_PARTY_NOTICES.md LICENSES/Apache-2.0.txt; do
+            if [[ ! -s "${required_file}" ]]; then
+              echo "Missing required release file: ${required_file}" >&2
+              exit 1
+            fi
+          done
+
+          download_json="$(go mod download -json "${EXPECTED_MODULE}@${TARGET_SHA}")"
+          module_zip="$(jq -er '.Zip' <<<"${download_json}")"
+          zip_entries="$(unzip -Z1 "${module_zip}")"
+          for required_file in LICENSE THIRD_PARTY_NOTICES.md LICENSES/Apache-2.0.txt; do
+            if ! grep -Eq "/${required_file}$" <<<"${zip_entries}"; then
+              echo "${required_file} is missing from the module zip." >&2
+              exit 1
+            fi
+          done
+
+      - name: Verify installation from the exact commit
+        env:
+          GOBIN: ${{ runner.temp }}/preflight-bin
+          GOCACHE: ${{ runner.temp }}/preflight-build-cache
+          GOMODCACHE: ${{ runner.temp }}/preflight-module-cache
+          GOPROXY: https://proxy.golang.org,direct
+        run: |
+          mkdir -p "${GOBIN}"
+          resolved_version="$(go list -m -f '{{.Version}}' "${EXPECTED_MODULE}@${TARGET_SHA}")"
+          go install "${EXPECTED_MODULE}/cmd/gomod-cooldown@${TARGET_SHA}"
+          go version -m "${GOBIN}/gomod-cooldown" | tee exact-commit-build-info.txt
+          grep -F "${EXPECTED_MODULE}/cmd/gomod-cooldown" exact-commit-build-info.txt
+          grep -F $'mod\t'"${EXPECTED_MODULE}"$'\t'"${resolved_version}" exact-commit-build-info.txt
+          version_output="$("${GOBIN}/gomod-cooldown" --version)"
+          if [[ "${version_output}" != "gomod-cooldown ${resolved_version}" ]]; then
+            echo "Unexpected --version output: ${version_output}" >&2
+            exit 1
+          fi
+
+      - name: Create the annotated immutable release tag
+        if: steps.release_state.outputs.tag_exists == 'false'
+        run: |
+          # Close the validation/tag-creation race for a new release. A resumed
+          # release is deliberately allowed after main has advanced.
+          git fetch --force --no-tags origin \
+            +refs/heads/main:refs/remotes/origin/main
+          main_sha="$(git rev-parse refs/remotes/origin/main)"
+          if [[ "${TARGET_SHA}" != "${main_sha}" ]]; then
+            echo "main advanced to ${main_sha} after validation; no tag was created." >&2
+            exit 1
+          fi
+
+          tag_object_sha="$(
+            gh api --method POST \
+              "repos/${GITHUB_REPOSITORY}/git/tags" \
+              -f tag="${RELEASE_TAG}" \
+              -f message="Release ${RELEASE_TAG}" \
+              -f object="${TARGET_SHA}" \
+              -f type=commit \
+              -f 'tagger[name]=github-actions[bot]' \
+              -f 'tagger[email]=41898282+github-actions[bot]@users.noreply.github.com' \
+              -f "tagger[date]=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+              --jq '.sha'
+          )"
+          ref_object_sha="$(
+            gh api --method POST \
+              "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref="refs/tags/${RELEASE_TAG}" \
+              -f sha="${tag_object_sha}" \
+              --jq '.object.sha'
+          )"
+          if [[ "${ref_object_sha}" != "${tag_object_sha}" ]]; then
+            echo "Tag ref did not resolve to the new annotated tag object." >&2
+            exit 1
+          fi
+
+          peeled_sha="$(
+            gh api \
+              "repos/${GITHUB_REPOSITORY}/git/tags/${ref_object_sha}" \
+              --jq '.object.sha'
+          )"
+          if [[ "${peeled_sha}" != "${TARGET_SHA}" ]]; then
+            echo "Tag ${RELEASE_TAG} resolved to ${peeled_sha}, not ${TARGET_SHA}." >&2
+            exit 1
+          fi
+
+      - name: Smoke-test installation from the release tag
+        env:
+          GOPROXY: https://proxy.golang.org,direct
+          TAG_VERIFY_ATTEMPTS: "6"
+          TAG_VERIFY_DELAY_SECONDS: "20"
+        run: |
+          verify_tag() {
+            local attempt="$1"
+            local attempt_root="${RUNNER_TEMP}/tag-smoke-${attempt}"
+            local gobin="${attempt_root}/bin"
+            local gocache="${attempt_root}/build-cache"
+            local gomodcache="${attempt_root}/module-cache"
+            local build_info="${attempt_root}/release-build-info.txt"
+            local download_json module_zip version_output zip_entries
+
+            mkdir -p "${gobin}" || return 1
+            GOBIN="${gobin}" GOCACHE="${gocache}" GOMODCACHE="${gomodcache}" \
+              go install "${EXPECTED_MODULE}/cmd/gomod-cooldown@${RELEASE_TAG}" || return 1
+
+            go version -m "${gobin}/gomod-cooldown" | tee "${build_info}" || return 1
+            grep -F "${EXPECTED_MODULE}/cmd/gomod-cooldown" "${build_info}" || return 1
+            grep -F $'mod\t'"${EXPECTED_MODULE}"$'\t'"${RELEASE_TAG}" "${build_info}" || return 1
+            version_output="$("${gobin}/gomod-cooldown" --version)" || return 1
+            if [[ "${version_output}" != "gomod-cooldown ${RELEASE_TAG}" ]]; then
+              echo "Unexpected --version output: ${version_output}" >&2
+              return 1
+            fi
+
+            download_json="$(
+              GOCACHE="${gocache}" GOMODCACHE="${gomodcache}" \
+                go mod download -json "${EXPECTED_MODULE}@${RELEASE_TAG}"
+            )" || return 1
+            module_zip="$(jq -er '.Zip' <<<"${download_json}")" || return 1
+            zip_entries="$(unzip -Z1 "${module_zip}")" || return 1
+            for required_file in LICENSE THIRD_PARTY_NOTICES.md LICENSES/Apache-2.0.txt; do
+              if ! grep -Eq "/${required_file}$" <<<"${zip_entries}"; then
+                echo "${required_file} is missing from the tagged module zip." >&2
+                return 1
+              fi
+            done
+          }
+
+          verified=false
+          for ((attempt = 1; attempt <= TAG_VERIFY_ATTEMPTS; attempt++)); do
+            echo "::group::Verify ${RELEASE_TAG} (attempt ${attempt}/${TAG_VERIFY_ATTEMPTS})"
+            if verify_tag "${attempt}"; then
+              verified=true
+              echo "::endgroup::"
+              break
+            fi
+            echo "::endgroup::"
+            if (( attempt < TAG_VERIFY_ATTEMPTS )); then
+              echo "Tag verification failed; retrying with fresh caches in ${TAG_VERIFY_DELAY_SECONDS}s." >&2
+              sleep "${TAG_VERIFY_DELAY_SECONDS}"
+            fi
+          done
+          if [[ "${verified}" != "true" ]]; then
+            echo "Tag verification failed after ${TAG_VERIFY_ATTEMPTS} attempts." >&2
+            exit 1
+          fi
+
+      - name: Publish the source-only GitHub release
+        run: |
+          release_args=(
+            release create "${RELEASE_TAG}"
+            --repo "${GITHUB_REPOSITORY}"
+            --verify-tag
+            --title "${RELEASE_TAG}"
+            --generate-notes
+          )
+          if [[ "${RELEASE_TAG}" == *-* ]]; then
+            release_args+=(--prerelease)
+          else
+            release_args+=(--latest)
+          fi
+          gh "${release_args[@]}"

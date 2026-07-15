@@ -1,32 +1,135 @@
 name: CI
 
-permissions:
-  contents: read
-
 on:
   push:
     branches:
       - main
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
+  unit:
+    name: unit (Go ${{ matrix.go-version }})
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        go-version:
+          - 1.25.x
+          - stable
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
-          go-version-file: go.mod
+          go-version: ${{ matrix.go-version }}
+      - run: go version
       - run: go test ./...
-      - run: go test -race ./...
       - run: go vet ./...
-  lint:
+
+  race:
+    name: race
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
-          go-version-file: go.mod
+          go-version: stable
+      - run: go test -race ./...
+
+  platform:
+    name: build/smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: stable
+      - name: Run tests on the target OS
+        run: go test ./...
+      - name: Build and smoke-test the CLI
+        shell: bash
+        run: |
+          binary=./gomod-cooldown
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then
+            binary=./gomod-cooldown.exe
+          fi
+
+          go build -trimpath -o "${binary}" ./cmd/gomod-cooldown
+          "${binary}" --help
+          "${binary}" --version
+          "${binary}" -- go version
+          go version -m "${binary}" | tee build-info.txt
+          grep -F "github.com/Goryudyuma/gomod-cooldown/cmd/gomod-cooldown" build-info.txt
+
+  vulnerability:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: stable
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+
+  # Keep this stable check name: the main branch ruleset requires "test".
+  test:
+    name: test
+    if: always()
+    needs:
+      - unit
+      - race
+      - platform
+      - vulnerability
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Require every test job to succeed
+        env:
+          UNIT_RESULT: ${{ needs.unit.result }}
+          RACE_RESULT: ${{ needs.race.result }}
+          PLATFORM_RESULT: ${{ needs.platform.result }}
+          VULNERABILITY_RESULT: ${{ needs.vulnerability.result }}
+        run: |
+          for result in \
+            "${UNIT_RESULT}" \
+            "${RACE_RESULT}" \
+            "${PLATFORM_RESULT}" \
+            "${VULNERABILITY_RESULT}"
+          do
+            if [[ "${result}" != "success" ]]; then
+              echo "A required test job did not succeed: ${result}" >&2
+              exit 1
+            fi
+          done
+
+  # Keep this stable check name: the main branch ruleset requires "lint".
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: stable
       - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
-          version: latest
+          version: v2.12.2

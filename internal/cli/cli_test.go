@@ -3,11 +3,17 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,22 +23,55 @@ import (
 
 const cacheHelperMarker = "gomod-cooldown-cache-helper"
 
+const processHelperMarker = "gomod-cooldown-process-helper"
+
 func TestParseCooldown(t *testing.T) {
 	for _, tt := range []struct {
-		s    string
-		want time.Duration
-		bad  bool
+		name  string
+		input string
+		want  time.Duration
+		bad   bool
 	}{
-		{"168h", 168 * time.Hour, false}, {"7d", 168 * time.Hour, false}, {"14d12h", 348 * time.Hour, false}, {"", 0, true}, {"7M", 0, true}, {"0", 0, true}, {"-1h", 0, true},
+		{name: "hours", input: "168h", want: 168 * time.Hour},
+		{name: "integer days", input: "7d", want: 168 * time.Hour},
+		{name: "decimal point without fraction", input: "1.d", want: 24 * time.Hour},
+		{name: "fractional days", input: "1.5d", want: 36 * time.Hour},
+		{name: "leading decimal", input: ".5d", want: 12 * time.Hour},
+		{name: "signed leading decimal", input: "+.5d", want: 12 * time.Hour},
+		{name: "leading decimal after unit", input: "1h.5d", want: 13 * time.Hour},
+		{name: "compound", input: "14d12h", want: 348 * time.Hour},
+		{name: "fractional compound", input: "1h1.25d30m", want: 31*time.Hour + 30*time.Minute},
+		{name: "sub nanosecond truncation", input: "0.00000000000001d1ns", want: time.Nanosecond},
+		{name: "fractional nanoseconds", input: "0.0000000000001d", want: 8 * time.Nanosecond},
+		{name: "maximum duration", input: "106751d23h47m16.854775807s", want: time.Duration(1<<63 - 1)},
+		{name: "empty", input: "", bad: true},
+		{name: "months unsupported", input: "7M", bad: true},
+		{name: "zero", input: "0", bad: true},
+		{name: "zero fractional day", input: "0.00000000000001d", bad: true},
+		{name: "negative", input: "-1h", bad: true},
+		{name: "negative leading decimal", input: "-.5d", bad: true},
+		{name: "embedded sign", input: "1d-1h", bad: true},
+		{name: "exponent unsupported", input: "1e2d", bad: true},
+		{name: "malformed decimal", input: "1..5d", bad: true},
+		{name: "uppercase day unsupported", input: "1D", bad: true},
+		{name: "day overflow", input: "106752d", bad: true},
+		{name: "compound overflow", input: "106751d23h47m16.854775808s", bad: true},
 	} {
-		got, err := ParseCooldown(tt.s)
-		if tt.bad {
-			if err == nil {
-				t.Fatal(tt.s)
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseCooldown(tt.input)
+			if tt.bad {
+				if err == nil {
+					t.Fatalf("ParseCooldown(%q) succeeded with %v", tt.input, got)
+				}
+				return
 			}
-		} else if err != nil || got != tt.want {
-			t.Fatalf("%s: %v %v", tt.s, got, err)
-		}
+			if err != nil {
+				t.Fatalf("ParseCooldown(%q): %v", tt.input, err)
+			}
+			if got != tt.want {
+				t.Fatalf("ParseCooldown(%q)=%v, want %v", tt.input, got, tt.want)
+			}
+		})
 	}
 }
 
@@ -41,6 +80,14 @@ func TestParseAndEnvironment(t *testing.T) {
 	o, err := Parse([]string{"--cooldown=7d", "--", "echo", "x"}, &errout)
 	if err != nil || o.Cooldown != 7*24*time.Hour || o.TimeSource != "commit" || o.Command[0] != "echo" {
 		t.Fatal(o, err)
+	}
+	help, err := Parse([]string{"--help"}, &errout)
+	if err != nil || help.action != actionHelp {
+		t.Fatalf("help=%+v err=%v", help, err)
+	}
+	version, err := Parse([]string{"--version"}, &errout)
+	if err != nil || version.action != actionVersion {
+		t.Fatalf("version=%+v err=%v", version, err)
 	}
 	for _, args := range [][]string{{}, {"--cooldown=0", "--", "x"}, {"--", ""}} {
 		if _, err := Parse(args, &errout); err == nil {
@@ -53,14 +100,155 @@ func TestParseAndEnvironment(t *testing.T) {
 	}
 }
 
+func TestRunHelpAndVersion(t *testing.T) {
+	for _, args := range [][]string{{"--help"}, {"-h"}, {"--help", "--", "must-not-run"}} {
+		var stdout, stderr bytes.Buffer
+		if code := Run(context.Background(), args, nil, &stdout, &stderr); code != 0 {
+			t.Fatalf("Run(%q)=%d, stderr=%q", args, code, stderr.String())
+		}
+		if !strings.HasPrefix(stdout.String(), "Usage: gomod-cooldown ") || !strings.Contains(stdout.String(), "-- command") {
+			t.Fatalf("Run(%q) stdout=%q", args, stdout.String())
+		}
+		if stderr.Len() != 0 {
+			t.Fatalf("Run(%q) stderr=%q", args, stderr.String())
+		}
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := Run(context.Background(), []string{"--version"}, nil, &stdout, &stderr); code != 0 {
+		t.Fatalf("version exit=%d stderr=%q", code, stderr.String())
+	}
+	if fields := strings.Fields(stdout.String()); len(fields) != 2 || fields[0] != "gomod-cooldown" || fields[1] == "" {
+		t.Fatalf("version stdout=%q", stdout.String())
+	}
+	if strings.Count(stdout.String(), "\n") != 1 || stderr.Len() != 0 {
+		t.Fatalf("version stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+}
+
+func TestRunUsageErrorIsPrintedOnce(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := Run(context.Background(), []string{"--unknown"}, nil, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("exit=%d stderr=%q", code, stderr.String())
+	}
+	if stdout.Len() != 0 || strings.Count(stderr.String(), "flag provided but not defined") != 1 {
+		t.Fatalf("stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+	if !strings.HasSuffix(stderr.String(), "Try 'gomod-cooldown --help' for usage.\n") {
+		t.Fatalf("missing usage hint: %q", stderr.String())
+	}
+}
+
+func TestExecutableHelpVersionAndChildExit(t *testing.T) {
+	executable := buildCLIExecutable(t)
+	for _, arg := range []string{"--help", "-h"} {
+		var stdout, stderr bytes.Buffer
+		cmd := exec.Command(executable, arg)
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("%s: %v, stderr=%q", arg, err, stderr.String())
+		}
+		if !strings.HasPrefix(stdout.String(), "Usage: gomod-cooldown ") || stderr.Len() != 0 {
+			t.Fatalf("%s: stdout=%q stderr=%q", arg, stdout.String(), stderr.String())
+		}
+	}
+
+	var stdout, stderr bytes.Buffer
+	cmd := exec.Command(executable, "--version")
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("version: %v, stderr=%q", err, stderr.String())
+	}
+	if fields := strings.Fields(stdout.String()); len(fields) != 2 || fields[0] != "gomod-cooldown" || stderr.Len() != 0 {
+		t.Fatalf("version stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	testExecutable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd = exec.Command(
+		executable, "--upstream=http://127.0.0.1:1", "--", testExecutable,
+		"-test.run=^TestRunProcessHelper$", "-test.count=1", "--", processHelperMarker, "exit", "23",
+	)
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	err = cmd.Run()
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() != 23 || stdout.Len() != 0 || stderr.Len() != 0 {
+		t.Fatalf("child exit: err=%v stdout=%q stderr=%q", err, stdout.String(), stderr.String())
+	}
+}
+
+func TestExecutablePreservesChildContractAndCleansUp(t *testing.T) {
+	executable := buildCLIExecutable(t)
+	testExecutable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cwd := t.TempDir()
+	var stdout, stderr bytes.Buffer
+	cmd := exec.Command(
+		executable, "--upstream=http://127.0.0.1:1", "--", testExecutable,
+		"-test.run=^TestRunProcessHelper$", "-test.count=1", "--", processHelperMarker, "contract", "one", "two words",
+	)
+	cmd.Dir = cwd
+	cmd.Env = append(os.Environ(), "GOMOD_COOLDOWN_CONTRACT=from-executable")
+	cmd.Stdin = strings.NewReader("black-box stdin")
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("run executable: %v, stderr=%q", err, stderr.String())
+	}
+	var got struct {
+		Args    []string
+		CWD     string
+		Env     string
+		GOPROXY string
+		Stdin   string
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("decode child output: %v: %q", err, stdout.String())
+	}
+	resolvedCWD, err := filepath.EvalSymlinks(cwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(got.Args, "|") != "one|two words" || got.CWD != resolvedCWD || got.Env != "from-executable" || got.Stdin != "black-box stdin" {
+		t.Fatalf("child contract=%+v, cwd want %q", got, cwd)
+	}
+	if !strings.HasPrefix(got.GOPROXY, "http://127.0.0.1:") || stderr.String() != "child stderr\n" {
+		t.Fatalf("GOPROXY=%q stderr=%q", got.GOPROXY, stderr.String())
+	}
+	client := &http.Client{Timeout: 500 * time.Millisecond}
+	if response, requestErr := client.Get(got.GOPROXY); requestErr == nil {
+		_ = response.Body.Close()
+		t.Fatalf("proxy still accepts requests after executable returned: %s", got.GOPROXY)
+	}
+}
+
+func buildCLIExecutable(t *testing.T) string {
+	t.Helper()
+	name := "gomod-cooldown"
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	executable := filepath.Join(t.TempDir(), name)
+	cmd := exec.Command("go", "build", "-o", executable, "../../cmd/gomod-cooldown")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("build CLI: %v\n%s", err, output)
+	}
+	return executable
+}
+
 func TestRunExitCodeAndDoesNotChangeEnvironment(t *testing.T) {
 	if os.Getenv("GOPROXY") == "" {
 		t.Setenv("GOPROXY", "https://proxy.example")
 	}
 	before := os.Getenv("GOPROXY")
 	var out, err bytes.Buffer
-	// commit mode avoids external setup; the child is run with argv, not a shell.
-	code := Run(context.Background(), []string{"--time-source=commit", "--upstream=http://127.0.0.1:1", "--", "sh", "-c", `case "$GOPROXY" in http://127.0.0.1:*) exit 7;; *) exit 9;; esac`}, nil, &out, &err)
+	code := runProcessHelper(t, strings.NewReader(""), &out, &err, "exit-with-proxy", "7")
 	if code != 7 {
 		t.Fatalf("code=%d stderr=%s", code, err.String())
 	}
@@ -71,16 +259,163 @@ func TestRunExitCodeAndDoesNotChangeEnvironment(t *testing.T) {
 
 func TestRunConnectsStandardStreamsAndDoesNotStartAfterSetupFailure(t *testing.T) {
 	var out, err bytes.Buffer
-	code := Run(context.Background(), []string{"--time-source=commit", "--upstream=http://127.0.0.1:1", "--", "sh", "-c", `read x; echo "out:$x"; echo "err:$x" >&2`}, strings.NewReader("hello\n"), &out, &err)
+	code := runProcessHelper(t, strings.NewReader("hello\n"), &out, &err, "streams")
 	if code != 0 || out.String() != "out:hello\n" || err.String() != "err:hello\n" {
 		t.Fatalf("code=%d out=%q err=%q", code, out.String(), err.String())
 	}
 	out.Reset()
 	err.Reset()
-	code = Run(context.Background(), []string{"--time-source=combined", "--upstream=http://example.invalid", "--", "sh", "-c", "exit 7"}, nil, &out, &err)
+	executable, executableErr := os.Executable()
+	if executableErr != nil {
+		t.Fatal(executableErr)
+	}
+	code = Run(context.Background(), []string{"--time-source=combined", "--upstream=http://example.invalid", "--", executable, "-test.run=^TestRunProcessHelper$", "--", processHelperMarker, "exit", "7"}, nil, &out, &err)
 	if code != 1 || strings.Contains(err.String(), "exit status 7") {
 		t.Fatalf("code=%d err=%q", code, err.String())
 	}
+}
+
+func TestRunChildContractAndProxyCleanup(t *testing.T) {
+	t.Setenv("GOMOD_COOLDOWN_CONTRACT", "preserved")
+	wantCWD, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	code := runProcessHelper(t, strings.NewReader("input bytes"), &stdout, &stderr, "contract", "alpha", "two words")
+	if code != 0 {
+		t.Fatalf("exit=%d stderr=%q", code, stderr.String())
+	}
+	var got struct {
+		Args    []string
+		CWD     string
+		Env     string
+		GOPROXY string
+		Stdin   string
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("decode child output: %v: %q", err, stdout.String())
+	}
+	if strings.Join(got.Args, "|") != "alpha|two words" || got.CWD != wantCWD || got.Env != "preserved" || got.Stdin != "input bytes" {
+		t.Fatalf("child contract=%+v, cwd want %q", got, wantCWD)
+	}
+	if !strings.HasPrefix(got.GOPROXY, "http://127.0.0.1:") {
+		t.Fatalf("GOPROXY=%q", got.GOPROXY)
+	}
+	if stderr.String() != "child stderr\n" {
+		t.Fatalf("stderr=%q", stderr.String())
+	}
+	client := &http.Client{Timeout: 500 * time.Millisecond}
+	if response, requestErr := client.Get(got.GOPROXY); requestErr == nil {
+		_ = response.Body.Close()
+		t.Fatalf("proxy still accepts requests after Run returned: %s", got.GOPROXY)
+	}
+}
+
+func TestRunCommandNotFound(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := Run(context.Background(), []string{"--", "gomod-cooldown-command-that-does-not-exist"}, nil, &stdout, &stderr)
+	if code != 127 {
+		t.Fatalf("exit=%d stderr=%q", code, stderr.String())
+	}
+	if stdout.Len() != 0 || strings.Count(stderr.String(), "gomod-cooldown:") != 1 || !strings.Contains(stderr.String(), "gomod-cooldown-command-that-does-not-exist") {
+		t.Fatalf("stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+}
+
+func TestRunProcessHelper(t *testing.T) {
+	marker := -1
+	for i, arg := range os.Args {
+		if arg == processHelperMarker {
+			marker = i
+			break
+		}
+	}
+	if marker < 0 {
+		return
+	}
+	args := os.Args[marker+1:]
+	if len(args) == 0 {
+		t.Fatal("helper mode is required")
+	}
+	switch args[0] {
+	case "exit", "exit-with-proxy":
+		runExitHelper(t, args)
+	case "streams":
+		runStreamsHelper(t)
+	case "contract":
+		runContractHelper(t, args[1:])
+	default:
+		t.Fatalf("unknown helper mode %q", args[0])
+	}
+}
+
+func runExitHelper(t *testing.T, args []string) {
+	t.Helper()
+	if len(args) != 2 {
+		t.Fatalf("exit helper args=%q", args)
+	}
+	code, err := strconv.Atoi(args[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if args[0] == "exit-with-proxy" && !strings.HasPrefix(os.Getenv("GOPROXY"), "http://127.0.0.1:") {
+		os.Exit(9)
+	}
+	os.Exit(code)
+}
+
+func runStreamsHelper(t *testing.T) {
+	t.Helper()
+	contents, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	line := strings.TrimSuffix(string(contents), "\n")
+	_, _ = fmt.Fprintf(os.Stdout, "out:%s\n", line)
+	_, _ = fmt.Fprintf(os.Stderr, "err:%s\n", line)
+	os.Exit(0)
+}
+
+func runContractHelper(t *testing.T, args []string) {
+	t.Helper()
+	contents, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := struct {
+		Args    []string
+		CWD     string
+		Env     string
+		GOPROXY string
+		Stdin   string
+	}{
+		Args: args, CWD: cwd, Env: os.Getenv("GOMOD_COOLDOWN_CONTRACT"),
+		GOPROXY: os.Getenv("GOPROXY"), Stdin: string(contents),
+	}
+	if err := json.NewEncoder(os.Stdout).Encode(payload); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = fmt.Fprintln(os.Stderr, "child stderr")
+	os.Exit(0)
+}
+
+func runProcessHelper(t *testing.T, stdin io.Reader, stdout, stderr io.Writer, args ...string) int {
+	t.Helper()
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := []string{
+		"--time-source=commit", "--upstream=http://127.0.0.1:1", "--", executable,
+		"-test.run=^TestRunProcessHelper$", "-test.count=1", "--", processHelperMarker,
+	}
+	command = append(command, args...)
+	return Run(context.Background(), command, stdin, stdout, stderr)
 }
 
 func TestRunInfoCacheLifetime(t *testing.T) {

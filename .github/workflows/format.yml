@@ -8,9 +8,7 @@ on:
       - reopened
       - closed
 
-permissions:
-  contents: write
-  pull-requests: write
+permissions: {}
 
 concurrency:
   group: go-formatting-${{ github.event.pull_request.number }}
@@ -22,6 +20,10 @@ jobs:
     # safely create a formatting pull request. The ordinary CI still runs.
     if: github.event.action == 'closed' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         if: github.event.action != 'closed'
@@ -31,11 +33,11 @@ jobs:
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         if: github.event.action != 'closed'
         with:
-          go-version-file: go.mod
+          go-version: stable
       - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         if: github.event.action != 'closed'
         with:
-          version: latest
+          version: v2.12.2
           install-only: true
       - run: golangci-lint fmt
         if: github.event.action != 'closed'

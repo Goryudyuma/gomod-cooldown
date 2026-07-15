@@ -158,9 +158,9 @@ opens or updates a formatting pull request when safe changes are available.
 
 ## License and notices
 
-This project is licensed under [Apache License 2.0](LICENSE). See
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for bundled dependency and test
-fixture notices.
+This project is licensed under the [MIT License](LICENSE). Bundled dependencies
+and test fixtures remain under their respective licenses; see
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for details.
 
 ## Inspiration
 

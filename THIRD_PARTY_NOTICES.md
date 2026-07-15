@@ -35,7 +35,8 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 The files under `internal/cli/testdata/large-modules` are unmodified,
 byte-for-byte copies of upstream `go.mod` files. They are used only as test
 fixtures. All three upstream projects license these files under the Apache
-License 2.0; a copy of that license is provided in [`LICENSE`](LICENSE).
+License 2.0; a copy of that license is provided in
+[`LICENSES/Apache-2.0.txt`](LICENSES/Apache-2.0.txt).
 
 ### Prometheus
 
